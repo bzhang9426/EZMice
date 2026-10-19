@@ -7,10 +7,9 @@ import threading
 import datetime
 import picamera
 import time
-import serial 
+import serial
 from subprocess import call
 import os
-
 
 class EZMiceApp:
     def __init__(self, master):
@@ -40,9 +39,8 @@ class EZMiceApp:
         ttk.Label(self.master, text='Chamber Number:').grid(row=1, column=0, sticky='w')
         ttk.Label(self.master, text='Animal Tag:').grid(row=2, column=0, sticky='w')
         ttk.Label(self.master, text='Folder Path:').grid(row=3, column=0, sticky='w')
-        ttk.Label(self.master, text='Stimulus Set:').grid(row=4, column=0, sticky='w')
-        ttk.Label(self.master, text='Loop Delay (ms):').grid(row=5, column=0, sticky='w')
-
+        ttk.Label(self.master, text='Stimulus Set (ms):').grid(row=4, column=0, sticky='w')
+        ttk.Label(self.master, text='Loop Delay (s):').grid(row=5, column=0, sticky='w')
         self.duration_entry = ttk.Entry(self.master, textvariable=self.record_duration)
         self.duration_entry.grid(row=0, column=1)
         ttk.Entry(self.master, textvariable=self.chamber_number).grid(row=1, column=1)
@@ -50,17 +48,17 @@ class EZMiceApp:
         self.folder_entry = ttk.Entry(self.master, textvariable=self.save_path, state='readonly')
         self.folder_entry.grid(row=3, column=1)
         ttk.Button(self.master, text='Select Folder', command=self.select_folder).grid(row=3, column=2)
-        
+
         self.record_button = ttk.Button(self.master, text='Record', command=self.toggle_record)
         self.record_button.grid(row=6, column=0, sticky='ew')
         ttk.Button(self.master, text='Capture Image', command=self.capture_and_display).grid(row=6, column=2, sticky='ew')
-        """
+
         self.info_label = ttk.Label(self.master, text='')
-        self.info_label.grid(row=5, column=0, columnspan=3)
+        self.info_label.grid(row=8, column=0, columnspan=3)
 
         self.image_label = ttk.Label(self.master)
-        self.image_label.grid(row=6, column=0, columnspan=3, sticky='nsew')
-        """
+        self.image_label.grid(row=9, column=0, columnspan=3, sticky='nsew')
+
         #Stimulus Entry (format = time1:stimulus1...stimulusn,....timen:stimulus1...stimulusn,)
         self.stim_set_entry = ttk.Entry(self.master, textvariable=self.stim_set)
         self.stim_set_entry.grid(row=4, column=1, columnspan=3, sticky='ew')
@@ -68,34 +66,42 @@ class EZMiceApp:
         #Loop delay entry
         self.delay_entry = ttk.Entry(self.master, textvariable=self.delay)
         self.delay_entry.grid(row=5, column=1, sticky='w')
-    
+
     def build_stim_dic(self):
         stim_dic = {}
         try:
-            stim_times = self.stim_set.get().split(',')
-            for stim_time in stim_times:
-                key_time = float(stim_time.split(':'))[0]
-                value_assay = stim_time.split(':')[1]
-                if not (key_time in stim_dic):
-                    stim_dic[key_time] = ""
-                stim_dic[key_time] += value_assay
+                if self.stim_set.get() != "":
+                        stim_times = self.stim_set.get().split(',')
+                        for stim_time in stim_times:
+                                key_time = float(stim_time.split(':')[0])
+                                value_assay = stim_time.split(':')[1]
+                                if not (key_time in stim_dic):
+                                        stim_dic[key_time] = ""
+                                stim_dic[key_time] += value_assay
+                else:
+                     stim_dic = {1:"w",2:"wr",3:"rg",4:'gv',5:"vs",6:"sh",7:"h"}
         except Exception as e:
             messagebox.showerror("Error", f"Stimulus set input error: {e}")
         return stim_dic
-    
+
     def send_serial(self):
         arduino = serial.Serial('/dev/ttyACM0', 9600, timeout = 1)
         time.sleep(2)
         arduino_start = time.perf_counter()
         round_time = -1
-        delay = int(self.delay.get())
+        if (self.delay.get() != ""):
+            delay = float(self.delay.get())
+        else:
+            delay = 0.05
         stim_dic = self.build_stim_dic()
 
         while self.recording:
-            if (round_time != 1000*int((time.perf_counter()-arduino_start)/delay)*delay):
-                round_time = 1000*int((time.perf_counter()-arduino_start)/delay)*delay
+            if (round_time != int((time.perf_counter()-arduino_start)/delay)*delay):
+                round_time = int((time.perf_counter()-arduino_start)/delay)*delay
                 if round_time in stim_dic:
                     for serial_char in stim_dic[round_time]:
+                        print(round_time)
+                        print(serial_char)
                         arduino.write(serial_char.encode('ascii'))
             time.sleep(delay) # Pause for less computing use
 
@@ -105,7 +111,7 @@ class EZMiceApp:
             self.arduino_thread.start()
         except Exception as e:
             messagebox.showerror("Error", f"Could not connect to Arduino: {e}")
-    
+
     def select_folder(self):
         folder = filedialog.askdirectory()
         if folder:
@@ -139,13 +145,12 @@ class EZMiceApp:
             camera.exposure_mode = 'auto' # Auto exposure mode
             camera.awb_mode = 'auto' # Auto white balance mode
             camera.iso = 100 # Set ISO to 100 for clearer image
-            
-            # Set digital zoom (crop area)
-            camera.zoom = (0.25,0.05,1,1) # Adjust these values as needed (x, y, width, height)
 
+            # Set digital zoom (crop area)
+            camera.zoom = (0.35,0.3,0.3,0.2)
             camera.start_preview()
             self.run_arduino() #Arduino function
-            time.sleep(2)
+            #time.sleep(2)
             camera.start_recording("{0}.h264".format(filename))
             self.info_label.config(text=f"Recording to {filename}")
             start_time = datetime.datetime.now()
@@ -164,7 +169,7 @@ class EZMiceApp:
             self.record_button.config(text='Record')
             command = "MP4Box -add {0}.h264 {1}.mp4".format(filename,filename)
             call([command], shell = True)
-            
+
     def capture_and_display(self):
         with picamera.PiCamera() as camera:
             camera.resolution = (1920, 1080)
