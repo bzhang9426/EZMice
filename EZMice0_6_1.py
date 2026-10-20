@@ -1,6 +1,6 @@
-
 #!/usr/bin/env python3
 
+from asyncio import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image
@@ -183,7 +183,7 @@ class EZMiceApp:
             camera.start_preview()
             self.run_arduino()
             camera.start_recording("{0}.h264".format(filename))
-            self.info_label.config(text=f"Recording to {filename}")
+            self.master.after(0, lambda: self.info_label.config(text=f"Recording to {filename}"))
 
             camera.wait_recording(int(self.record_duration.get()))
 
@@ -191,7 +191,7 @@ class EZMiceApp:
             camera.stop_preview()
 
             if self.recording:
-                self.info_label.config(text=f"Video saved to {filename}")
+                self.master.after(0, lambda: self.info_label.config(text=f"Video saved to {filename}"))
             else:
                 self.info_label.config(text="Recording stopped.")
 
@@ -203,6 +203,53 @@ class EZMiceApp:
 
             if os.path.exists(filename + fileType):
                 self.process_video(filename + fileType, f"{filename}_motion_indices.csv")
+    
+    def find_plate_corners(self, img):
+        """Automatically finds the 4 corners of a rectangular well plate using OpenCV."""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Use Canny edge detection to find the plate's borders
+        edged = cv2.Canny(blurred, 50, 150)
+        
+        # Find contours
+        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Sort contours by area, keeping the largest ones
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        
+        for c in contours:
+            # Approximate the contour into a polygon
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            
+            # If the approximated contour has 4 points, we found our rectangle!
+            if len(approx) == 4:
+                # Reshape from (4, 1, 2) to (4, 2) and convert to float32
+                pts = approx.reshape(4, 2).astype(np.float32)
+                print("Successfully found plate corners.")
+                self.plate_corners = self.order_points(pts)
+                break
+
+        # Fallback to your default hardcoded corners if auto-detection fails
+        return cv2.drawContours(image_copy, contours, -1, (0, 255, 0), 3)
+
+
+    def order_points(self, pts):
+        """Helper to sort 4 points into: Top-Left, Top-Right, Bottom-Right, Bottom-Left."""
+        rect = np.zeros((4, 1, 2), dtype="float32")
+        
+        # Top-left has the smallest sum; bottom-right has the largest sum
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        
+        # Top-right has the smallest difference; bottom-left has the largest difference
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        
+        return rect.reshape(4, 2)
 
     def process_video(self, video_path, output_csv_path):
         cap = cv2.VideoCapture(video_path)
@@ -219,7 +266,8 @@ class EZMiceApp:
             cap.release()
             return
 
-        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        #prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        prev_gray = self.find_plate_corners(prev_frame)
         prev_warp = self.apply_warp(prev_gray)
 
         # Define 96-well grid boundaries (12 columns x 8 rows)
@@ -282,8 +330,8 @@ class EZMiceApp:
 
     def capture_and_calibrate(self):
         try:
-            image_path = 'calibration_capture.jpg'
-            preview_path = 'calibrated_plate_preview.jpg'
+            image_path = self.save_path.get() + '/calibration_capture.jpg'
+            preview_path = self.save_path.get() + '/calibrated_plate_preview.jpg'
 
             with picamera.PiCamera() as camera:
                 camera.resolution = (1296, 972)
@@ -297,6 +345,8 @@ class EZMiceApp:
                 messagebox.showerror("Error", "Failed to load calibration image.")
                 return
 
+
+            self.find_plate_corners(img)
             warped = self.apply_warp(img)
 
             # Draw 8x12 grid overlay
