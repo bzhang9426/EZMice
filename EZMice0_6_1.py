@@ -214,7 +214,17 @@ class EZMiceApp:
         
         # Find contours
         contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+        """ Alternative: Otsu's thesholding
+        bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+
+        # Apply Otsu's Thresholding to create a binary mask
+        # The 0 threshold value is ignored because cv2.THRESH_OTSU dynamically calculates it
+        optimal_thresh, binary_mask = cv2.threshold(bilateral, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        print(f"Otsu's calculated optimal threshold value: {optimal_thresh}")
+
+        # Find the contours inside the binary image
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        """
         # Sort contours by area, keeping the largest ones
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
         
