@@ -3,7 +3,7 @@
 from asyncio import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from PIL import Image
+from PIL import Image, ImageTk
 import threading
 import datetime
 import picamera
@@ -38,8 +38,10 @@ class EZMiceApp:
 
         # Plate Calibration Points & Target Dimensions
         self.plate_corners = np.float32([[100, 100], [1196, 100], [1196, 872], [100, 872]])
-        self.target_width = 1200
-        self.target_height = 800
+        self.target_width = 600
+        self.target_height = 400
+        self.pmarg_x = 50
+        self.pmarg_y = 40
 
         # Build the GUI
         self.create_widgets()
@@ -133,6 +135,7 @@ class EZMiceApp:
                     for serial_char in stim_dic[round_time]:
                         arduino.write(serial_char.encode('ascii'))
             time.sleep(delay)
+        arduino.close()
 
     def run_arduino(self):
         try:
@@ -171,21 +174,23 @@ class EZMiceApp:
         save_dir = self.save_path.get()
         filename = save_dir + self.get_filename()
         fileType = ".mp4"
-        os.chdir(save_dir)
+        #os.chdir(save_dir)
 
         with picamera.PiCamera() as camera:
             camera.resolution = (1296, 972)
             camera.exposure_mode = 'auto'
             camera.awb_mode = 'auto'
             camera.iso = 100
-            camera.zoom = (0.35, 0.3, 0.3, 0.2)
+            camera.zoom = (0.4, 0.3, 0.25, 0.25)
 
             camera.start_preview()
             self.run_arduino()
             camera.start_recording("{0}.h264".format(filename))
             self.master.after(0, lambda: self.info_label.config(text=f"Recording to {filename}"))
-
-            camera.wait_recording(int(self.record_duration.get()))
+            elapsed = 0
+            while self.recording and elapsed < int(self.record_duration.get()):
+                camera.wait_recording(1)
+                elapsed += 1
 
             camera.stop_recording()
             camera.stop_preview()
@@ -196,6 +201,7 @@ class EZMiceApp:
                 self.info_label.config(text="Recording stopped.")
 
             self.recording = False
+            camera.close()
             self.record_button.config(text='Record & Analyze')
 
             command = "MP4Box -add {0}.h264 {1}.mp4".format(filename, filename)
@@ -203,62 +209,64 @@ class EZMiceApp:
 
             if os.path.exists(filename + fileType):
                 self.process_video(filename + fileType, f"{filename}_motion_indices.csv")
-    
+
     def find_plate_corners(self, img):
         """Automatically finds the 4 corners of a rectangular well plate using OpenCV."""
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Use Canny edge detection to find the plate's borders
-        edged = cv2.Canny(blurred, 50, 150)
-        
+        blurred = cv2.GaussianBlur(gray, (15,15), 0) ###gray
+        blurred = cv2.convertScaleAbs(blurred, alpha=1.5, beta=0)
+        otsu_thresh, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        edged1 = cv2.Canny(blurred, int(otsu_thresh/12), int(otsu_thresh/5))
+
         # Find contours
-        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        """ Alternative: Otsu's thesholding
-        bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+        contours1, _ = cv2.findContours(edged1.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Draw secondary layer
+        cv2.drawContours(edged1, contours1, -1, (255, 255, 255), 20)
 
-        # Apply Otsu's Thresholding to create a binary mask
-        # The 0 threshold value is ignored because cv2.THRESH_OTSU dynamically calculates it
-        optimal_thresh, binary_mask = cv2.threshold(bilateral, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        print(f"Otsu's calculated optimal threshold value: {optimal_thresh}")
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7,7))
+        closed_mask = cv2.morphologyEx(edged1, cv2.MORPH_CLOSE, kernel)
 
-        # Find the contours inside the binary image
-        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        """
+        edged2 = cv2.Canny(closed_mask, 20, 50)
+        contours2, _ = cv2.findContours(edged2.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         # Sort contours by area, keeping the largest ones
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        
+        contours = sorted(contours2, key=cv2.contourArea, reverse=True)
+        i = 0
         for c in contours:
             # Approximate the contour into a polygon
+            convex = cv2.convexHull(c)
+            area = cv2.contourArea(c)
             peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            
+            approx = cv2.approxPolyDP(convex, 0.02*peri, True)
+            #cv2.drawContours(img, [convex], -1, (0, 0, 255), 4)
+            #cv2.drawContours(img, [approx], -1, (0, 255, 0), 4)
+            #cv2.drawContours(img, contours, -1, (255, 0, 0), 4)
+
             # If the approximated contour has 4 points, we found our rectangle!
             if len(approx) == 4:
                 # Reshape from (4, 1, 2) to (4, 2) and convert to float32
                 pts = approx.reshape(4, 2).astype(np.float32)
                 print("Successfully found plate corners.")
                 self.plate_corners = self.order_points(pts)
-                break
+                print(self.plate_corners)
+                return img
 
         # Fallback to your default hardcoded corners if auto-detection fails
-        return cv2.drawContours(image_copy, contours, -1, (0, 255, 0), 3)
-
-
+        print("Failed to find corners")
+        return img
     def order_points(self, pts):
         """Helper to sort 4 points into: Top-Left, Top-Right, Bottom-Right, Bottom-Left."""
         rect = np.zeros((4, 1, 2), dtype="float32")
-        
+
         # Top-left has the smallest sum; bottom-right has the largest sum
         s = pts.sum(axis=1)
         rect[0] = pts[np.argmin(s)]
         rect[2] = pts[np.argmax(s)]
-        
+
         # Top-right has the smallest difference; bottom-left has the largest difference
         diff = np.diff(pts, axis=1)
         rect[1] = pts[np.argmin(diff)]
         rect[3] = pts[np.argmax(diff)]
-        
+
         return rect.reshape(4, 2)
 
     def process_video(self, video_path, output_csv_path):
@@ -276,20 +284,20 @@ class EZMiceApp:
             cap.release()
             return
 
-        #prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-        prev_gray = self.find_plate_corners(prev_frame)
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        #prev_gray = self.find_plate_corners(prev_frame)
         prev_warp = self.apply_warp(prev_gray)
 
         # Define 96-well grid boundaries (12 columns x 8 rows)
-        row_step = self.target_height / 8.0
-        col_step = self.target_width / 12.0
+        row_step = (self.target_height + 2*self.pmarg_y) / 8.0
+        col_step = (self.target_width + 2*self.pmarg_x) / 12.0
         well_boxes = []
         for r in range(8):
             for c in range(12):
-                x1 = int(c * col_step)
-                y1 = int(r * row_step)
-                x2 = int((c + 1) * col_step)
-                y2 = int((r + 1) * row_step)
+                x1 = int(self.pmarg_x + c * col_step)
+                y1 = int(self.pmarg_y + r * row_step)
+                x2 = int(self.pmarg_x + (c + 1) * col_step)
+                y2 = int(self.pmarg_y + (r + 1) * row_step)
                 well_boxes.append((r, c, x1, y1, x2, y2))
 
         with open(output_csv_path, mode='w', newline='') as csv_file:
@@ -341,14 +349,19 @@ class EZMiceApp:
     def capture_and_calibrate(self):
         try:
             image_path = self.save_path.get() + '/calibration_capture.jpg'
-            preview_path = self.save_path.get() + '/calibrated_plate_preview.jpg'
+            preview_path = self.save_path.get()  + '/calibrated_plate_preview.jpg'
 
             with picamera.PiCamera() as camera:
-                camera.resolution = (1296, 972)
+                camera.resolution = (int(1296), int(972))
+                camera.exposure_mode = 'auto'
+                camera.awb_mode = 'auto'
                 camera.iso = 100
-                camera.zoom = (0.35, 0.3, 0.3, 0.2)
-                time.sleep(2)
+                camera.zoom = (0.4, 0.3, 0.25, 0.25)
+                camera.start_preview()
+                time.sleep(5)
+                camera.stop_preview()
                 camera.capture(image_path)
+
 
             img = cv2.imread(image_path)
             if img is None:
@@ -356,27 +369,47 @@ class EZMiceApp:
                 return
 
 
-            self.find_plate_corners(img)
-            warped = self.apply_warp(img)
+            gray = self.find_plate_corners(img)
+            warped = self.apply_warp(gray)
 
             # Draw 8x12 grid overlay
-            row_step = self.target_height / 8.0
-            col_step = self.target_width / 12.0
+            row_step = (self.target_height-2*self.pmarg_y) / 8.0
+            col_step = (self.target_width-2*self.pmarg_x)/ 12.0
 
-            for r in range(1, 8):
-                y = int(r * row_step)
-                cv2.line(warped, (0, y), (self.target_width, y), (0, 255, 0), 1)
+            for r in range(9):
+                y = int(r * row_step) + self.pmarg_y
+                cv2.line(warped, (0, y), (self.target_width, y), (0, 150, 255 if r%8==0 else 0), 2)
 
-            for c in range(1, 12):
-                x = int(c * col_step)
-                cv2.line(warped, (x, 0), (x, self.target_height), (0, 255, 0), 1)
+            for c in range(13):
+                x = int(c * col_step) + self.pmarg_x
+                cv2.line(warped, (x, 0), (x, self.target_height), (0, 150, 255 if c%12==0 else 0), 2)
 
-            cv2.imwrite(preview_path, warped)
+            cv2.imwrite(preview_path, warped) #####warped
+            pil_img = Image.open(preview_path)
+            #Image.open(preview_path).show()
+            pil_img = Image.open(preview_path).resize((640,400), Image.LANCZOS)
 
-            # Open preview image and clean up via subprocess call
-            Image.open(preview_path).show()
+            # Create the popup window
+            popup = tk.Toplevel(self.master)
+            popup.title("Plate Calibration Preview")
+
+            # Convert image for Tkinter
+            tk_img = ImageTk.PhotoImage(pil_img)
+
+            # Display image in the popup
+            popup_label = ttk.Label(popup, image=tk_img)
+            popup_label.image = tk_img  # Keep reference to prevent garbage collection!
+            popup_label.pack(padx=10, pady=10)
+
+            # Add a close button so the user can dismiss it easily
+            #ttk.Button(popup, text="Close", command=popup.destroy).pack(pady=5)
+            # -------------------------------------------------------
             time.sleep(1)
-            call(["rm", "-f", image_path, preview_path])
+            for path in (image_path, preview_path):
+                if os.path.exists(path):
+                    os.remove(path)
+                else:
+                    print(f"Failed to delete {path}")
 
             self.info_label.config(text="Calibration preview generated with grid overlay.")
 
@@ -392,3 +425,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
