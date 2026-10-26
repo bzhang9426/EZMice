@@ -46,6 +46,9 @@ class EZMiceApp:
         # Build the GUI
         self.create_widgets()
 
+        # Camera Settings
+        self.awbgains = (1.0, 2.3);
+
     def create_widgets(self):
         ttk.Label(self.master, text='Record Duration (s):').grid(row=0, column=0, sticky='w', padx=5, pady=2)
         ttk.Label(self.master, text='Chamber Number:').grid(row=1, column=0, sticky='w', padx=5, pady=2)
@@ -178,8 +181,9 @@ class EZMiceApp:
 
         with picamera.PiCamera() as camera:
             camera.resolution = (1296, 972)
-            camera.exposure_mode = 'auto'
-            camera.awb_mode = 'auto'
+            camera.exposure_mode = 'backlight'
+            camera.aw_gains = self.awbgains
+            camera.awb_mode = 'off'
             camera.iso = 100
             camera.zoom = (0.4, 0.3, 0.25, 0.25)
 
@@ -204,7 +208,8 @@ class EZMiceApp:
             camera.close()
             self.record_button.config(text='Record & Analyze')
 
-            command = "MP4Box -add {0}.h264 {1}.mp4".format(filename, filename)
+            #command = "MP4Box -add {0}.h264 {1}.mp4".format(filename, filename)
+            command = "ffmpeg -y -framerate 30 -i {0}.h264 -c copy {0}.mp4".format(filename)
             call([command], shell=True)
 
             if os.path.exists(filename + fileType):
@@ -214,7 +219,8 @@ class EZMiceApp:
         """Automatically finds the 4 corners of a rectangular well plate using OpenCV."""
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (15,15), 0) ###gray
-        blurred = cv2.convertScaleAbs(blurred, alpha=1.5, beta=0)
+        blurred = cv2.convertScaleAbs(blurred, alpha=1.5, beta=0) #blurred
+
         otsu_thresh, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         edged1 = cv2.Canny(blurred, int(otsu_thresh/12), int(otsu_thresh/5))
 
@@ -237,9 +243,9 @@ class EZMiceApp:
             area = cv2.contourArea(c)
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(convex, 0.02*peri, True)
-            #cv2.drawContours(img, [convex], -1, (0, 0, 255), 4)
-            #cv2.drawContours(img, [approx], -1, (0, 255, 0), 4)
-            #cv2.drawContours(img, contours, -1, (255, 0, 0), 4)
+            cv2.drawContours(img, [convex], -1, (0, 0, 255), 4)
+            cv2.drawContours(img, [approx], -1, (0, 255, 0), 4)
+            cv2.drawContours(img, contours, -1, (255, 0, 0), 4)
 
             # If the approximated contour has 4 points, we found our rectangle!
             if len(approx) == 4:
@@ -301,11 +307,17 @@ class EZMiceApp:
                 well_boxes.append((r, c, x1, y1, x2, y2))
 
         with open(output_csv_path, mode='w', newline='') as csv_file:
+            #CSV setup
             writer = csv.writer(csv_file)
             header = ['Frame', 'Time (s)']
             for r, c, _, _, _, _ in well_boxes:
                 header.append(f"{chr(65+r)}{c+1}")
             writer.writerow(header)
+
+            #Analysis video setup
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            analysis_path = video_path.replace(".mp4", "_analysis.avi")
+            analysis_writer = cv2.VideoWriter(analysis_path, fourcc, 30, (self.target_width,self.target_height))
 
             frame_idx = 0
             while cap.isOpened():
@@ -322,7 +334,9 @@ class EZMiceApp:
                 # Frame subtraction
                 diff = cv2.absdiff(warp_frame, prev_warp)
                 _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-
+                thresh_color = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+                # Analysis video write
+                analysis_writer.write(thresh_color)
                 row_data = [frame_idx, round(current_time, 3)]
                 for r, c, x1, y1, x2, y2 in well_boxes:
                     well_roi = thresh[y1:y2, x1:x2]
@@ -331,7 +345,7 @@ class EZMiceApp:
 
                 writer.writerow(row_data)
                 prev_warp = warp_frame
-
+        analysis_writer.release()
         cap.release()
         self.master.after(0, lambda: self.info_label.config(text=f"Analysis complete! Saved: {os.path.basename(output_csv_path)}"))
 
@@ -353,10 +367,15 @@ class EZMiceApp:
 
             with picamera.PiCamera() as camera:
                 camera.resolution = (int(1296), int(972))
-                camera.exposure_mode = 'auto'
+                camera.exposure_mode = 'backlight' #auto
                 camera.awb_mode = 'auto'
                 camera.iso = 100
                 camera.zoom = (0.4, 0.3, 0.25, 0.25)
+                time.sleep(2)
+                self.awbgains = camera.awb_gains
+                camera.awb_mode = 'off'
+                camera.awb_gains = self.awbgains
+
                 camera.start_preview()
                 time.sleep(5)
                 camera.stop_preview()
@@ -425,4 +444,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
