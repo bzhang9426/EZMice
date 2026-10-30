@@ -2,15 +2,15 @@
 """
 EZMice v0.4.1 — well-plate recording and per-well motion scoring.
 
-B: Records a plate assay, pulses an Arduino from a stimulus schedule, and
+Behavior: Records a plate assay, pulses an Arduino from a stimulus schedule, and
    writes a motion index for each of the 96 wells. Tkinter front end for a
    Raspberry Pi: PiCamera records H264, ffmpeg remuxes it to MP4, and OpenCV
    warps the plate into a fixed rectangle before frame-subtraction.
    Calibration stores the plate corners and the white-balance gains that
    later recordings reuse.
-E: None at import. Each method reports its own failures.
-R: None. Runs until the window is closed.
-P: None. Start with `python3 ezmice.py`.
+Exceptions: None at import. Each method reports its own failures.
+Returns: None. Runs until the window is closed.
+Parameters: None. Start with `python3 ezmice.py`.
 """
 
 from asyncio import subprocess
@@ -64,7 +64,8 @@ class EZMiceApp:
         self.animal_tag = tk.StringVar()
         self.save_path = tk.StringVar()
         self.recording = False
-
+        # Assay type: "short" for 30 fps, "extended" for 2 fps. The latter is used in overnight
+        self.extended_assay = True # "short" or "extended"
         # Stimulus schedule text ("time:chars,...") and the serial tick length.
         self.stim_set = tk.StringVar()
         self.delay = tk.StringVar()
@@ -80,6 +81,10 @@ class EZMiceApp:
 
         # Red and blue gains. Calibration overwrites this after sampling auto AWB.
         self.awbgains = (1.0, 2.3)
+        # Shutter speed. Calibration overwrites this after sampling auto exposure.
+        self.shutter = 100000
+        # Frame rate: 30 fps standard for short assays, 2 fps for extended studies
+        self.frame_rate = 2 if self.extended_assay else 30
 
         self.create_widgets()
 
@@ -170,8 +175,11 @@ class EZMiceApp:
                     if not (key_time in stim_dic):
                         stim_dic[key_time] = ""
                     stim_dic[key_time] += value_assay
+            elif self.extended_assay:
+                stim_dic = {datetime.datetime.now().hour: "w", 23: "w", 9: "w", 23: "w"}
             else:
-                stim_dic = {1: "w", 2: "wr", 3: "rg", 4: 'gv', 5: "vs", 6: "sh", 7: "h"}
+                stim_dic = {1: "w", 2: "wr", 3: "rg", 4: "gv", 5: "vs", 6: "sh", 7: "h"}
+
         except Exception as e:
             messagebox.showerror("Error", f"Stimulus set input error: {e}")
         return stim_dic
@@ -197,15 +205,17 @@ class EZMiceApp:
             messagebox.showerror("Error", f"Could not connect to Arduino: {e}")
             return
 
-        arduino_start = time.perf_counter()
         round_time = -1
-
+        arduino_start = time.perf_counter()
         delay = float(self.delay.get()) if self.delay.get() != "" else 0.05
         stim_dic = self.build_stim_dic()
 
         # Fire once per quantized timestamp, not once per loop iteration.
         while self.recording:
-            current_round_time = int((time.perf_counter() - arduino_start) / delay) * delay
+            if self.extended_assay:
+                current_round_time = datetime.datetime.now().hour
+            else:
+                current_round_time = int((time.perf_counter() - arduino_start) / delay) * delay
             if round_time != current_round_time:
                 round_time = current_round_time
                 if round_time in stim_dic:
@@ -291,7 +301,7 @@ class EZMiceApp:
            the plate, with white balance forced to self.awbgains. The Arduino
            thread starts with the recording. The loop waits one second at a
            time until Stop is pressed or the duration elapses. ffmpeg copies
-           the H264 into an MP4 at 30 fps. process_video runs only when that
+           the H264 into an MP4 at self.frame_rate fps. process_video runs only when that
            MP4 exists. Status text is posted to the Tk thread with master.after.
            Clearing self.recording also ends send_serial before the remux.
         E: Camera, filesystem, and ffmpeg failures are not caught here and
@@ -306,6 +316,7 @@ class EZMiceApp:
 
         with picamera.PiCamera() as camera:
             camera.resolution = (1296, 972)
+            camera.framerate = self.frame_rate
             camera.exposure_mode = 'backlight'
             camera.awb_gains = self.awbgains
             camera.awb_mode = 'off'
@@ -336,7 +347,7 @@ class EZMiceApp:
 
             # Stream copy: keep the camera's frames, just change the container.
             #command = "MP4Box -add {0}.h264 {1}.mp4".format(filename, filename)
-            command = "ffmpeg -y -framerate 30 -i {0}.h264 -c copy {0}.mp4".format(filename)
+            command = f"ffmpeg -y -framerate {self.frame_rate} -i {filename}.h264 -c copy {filename}.mp4"
             call([command], shell=True)
 
             if os.path.exists(filename + fileType):
@@ -561,10 +572,14 @@ class EZMiceApp:
                 camera.awb_mode = 'auto'
                 camera.iso = 100
                 camera.zoom = (0.4, 0.3, 0.25, 0.25)
-                # Let auto AWB settle, then pin the gains for this process.
+
+                # Let auto AWB and auto exposure settle, then pin the settings for this process.
                 time.sleep(2)
                 self.awbgains = camera.awb_gains
+                self.shutter = camera.shutter_speed
                 camera.awb_mode = 'off'
+                camera.exposure_mode = 'off'
+                camera.shutter_speed = self.shutter
                 camera.awb_gains = self.awbgains
                 print(self.awbgains)
 
@@ -610,8 +625,7 @@ class EZMiceApp:
             popup_label.image = tk_img  # Keep reference to prevent garbage collection!
             popup_label.pack(padx=10, pady=10)
 
-            #ttk.Button(popup, text="Close", command=popup.destroy).pack(pady=5)
-            # -------------------------------------------------------
+            #Delete temporary files after a short delay to ensure the image is displayed
             time.sleep(1)
             for path in (image_path, preview_path):
                 if os.path.exists(path):
