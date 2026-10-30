@@ -159,7 +159,7 @@ class EZMiceApp:
 
 
         self.info_label = ttk.Label(self.master, text='')
-        self.info_label.grid(row=6, column=0, columnspan=3, padx=5, pady=5)
+        self.info_label.grid(row=7, column=0, columnspan=2, padx=5, pady=5)
 
 
         self.image_label = ttk.Label(self.master)
@@ -373,7 +373,7 @@ class EZMiceApp:
         save_dir = self.save_path.get()
         filename = save_dir + self.get_filename()
         fileType = ".mp4"
-        #os.chdir(save_dir)
+        self.frame_rate = 2 if self.extended_assay.get() else 30
 
 
         with picamera.PiCamera() as camera:
@@ -543,16 +543,11 @@ class EZMiceApp:
             return
 
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0:
-            fps = 30.0
-
-
+        fps = self.frame_rate
         ret, prev_frame = cap.read()
         if not ret:
             cap.release()
             return
-
 
         prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
         #prev_gray = self.find_plate_corners(prev_frame)
