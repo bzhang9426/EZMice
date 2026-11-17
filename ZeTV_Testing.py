@@ -29,8 +29,6 @@ import cv2
 import numpy as np
 import csv
 
-
-
 class EZMiceApp:
     """
     B: Operator window for one chamber's recording, stimulus, and analysis.
