@@ -20,13 +20,16 @@ from PIL import Image, ImageTk
 import threading
 import datetime
 import picamera
+
 import time
+
 import serial
 from subprocess import call
 import os
 import cv2
 import numpy as np
 import csv
+
 
 
 class EZMiceApp:
@@ -72,7 +75,9 @@ class EZMiceApp:
         self.extended_assay = tk.IntVar() # 0 "short" or 1 "extended"
         # Stimulus schedule text ("time:chars,...") and the serial tick length.
         self.stim_set = tk.StringVar()
-        self.delay = tk.StringVar()
+        self.scheduled_start = tk.StringVar()
+        self.shutdown = 'c'
+        self.signal_tracker = {}
 
         # Source-image corners (TL, TR, BR, BL) and the rectangle they warp into.
         self.plate_corners = np.float32([[100, 100], [1196, 100], [1196, 872], [100, 872]])
@@ -121,7 +126,7 @@ class EZMiceApp:
         ttk.Label(self.master, text='Animal Tag:').grid(row=2, column=0, sticky='w', padx=5, pady=2)
         ttk.Label(self.master, text='Folder Path:').grid(row=3, column=0, sticky='w', padx=5, pady=2)
         ttk.Label(self.master, text='Stimulus Set:').grid(row=4, column=0, sticky='w', padx=5, pady=2)
-        ttk.Label(self.master, text='Loop Delay (s):').grid(row=5, column=0, sticky='w', padx=5, pady=2)
+        ttk.Label(self.master, text='Scheduled Start Time (HH.MM):').grid(row=5, column=0, sticky='w', padx=5, pady=2)
 
         ttk.Checkbutton(self.master, text="Extended", variable=self.extended_assay).grid(row=0,column=2,padx=5,pady=2)
         self.duration_entry = ttk.Entry(self.master, textvariable=self.record_duration)
@@ -138,8 +143,8 @@ class EZMiceApp:
         self.stim_set_entry.grid(row=4, column=1, columnspan=2, sticky='ew', padx=5, pady=2)
 
         # Seconds between serial time checks. Empty means 0.05 in send_serial.
-        self.delay_entry = ttk.Entry(self.master, textvariable=self.delay)
-        self.delay_entry.grid(row=5, column=1, sticky='w', padx=5, pady=2)
+        self.start_entry = ttk.Entry(self.master, textvariable=self.scheduled_start)
+        self.start_entry.grid(row=5, column=1, sticky='w', padx=5, pady=2)
 
         self.record_button = ttk.Button(self.master, text='Record & Analyze', command=self.toggle_record)
         self.record_button.grid(row=6, column=0, sticky='ew', padx=5, pady=5)
@@ -224,7 +229,7 @@ class EZMiceApp:
                         stim_dic[key_time] = ""
                     stim_dic[key_time] += value_assay
             else:
-                hour = datetime.datetime.now().hour
+                hour = datetime.datetime.now().hour + datetime.datetime.now().minute / 100.0
                 stim_dic = (
                     {hour:"w", 23: "w", 9:"w", 23:"w"}
                     if self.extended_assay.get()
@@ -243,11 +248,14 @@ class EZMiceApp:
         """
         if time.perf_counter() - last_time >= duration:
             last_time = time.perf_counter()
-            signal_list.append(signal_list.pop(0))
+            #signal_list.append(signal_list.pop(0))
             #Last list item is the signal currently "on",
             #first list item is next one to be turned "on"
             arduino.write(signal_list[0].encode('ascii'))
+            self.signal_tracker.add(signal_list[0])
             arduino.write(signal_list[len(signal_list) - 1].encode('ascii'))
+            self.signal_tracker.remove(signal_list[len(signal_list) - 1])
+            signal_list = signal_list[1:] + [signal_list[0]]
         return last_time
     def send_serial(self):
         """
@@ -264,7 +272,7 @@ class EZMiceApp:
            not re-raised. A non-numeric Loop Delay raises ValueError from float()
            and is not caught. Write errors on the open port propagate.
         R: None.
-        P: None. Reads self.delay, self.recording, self.extended_assay, and the stimulus field.
+        P: None. Reads self.scheduled_start, self.recording, self.extended_assay, and the stimulus field.
         """
         try:
             arduino = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
@@ -274,24 +282,38 @@ class EZMiceApp:
             return
 
         round_time = -1
-        last_time = time.perf_counter()
         arduino_start = time.perf_counter()
-        delay = float(self.delay.get()) if self.delay.get() != "" else 0.05
+        delay = 0.05
         stim_dic = self.build_stim_dic()
+        last_time = time.perf_counter()
+        recording_tracker = 0
 
         # Fire once per new key, not once per loop iteration.
-        while self.recording:
+        while recording_tracker < 2:
             if self.extended_assay.get():
-                current_round_time = datetime.datetime.now().hour
+                current_round_time = datetime.datetime.now().hour + datetime.datetime.now().minute / 100.0
             else:
                 current_round_time = int((time.perf_counter() - arduino_start) / delay) * delay
             if round_time != current_round_time:
                 round_time = current_round_time
                 if round_time in stim_dic:
                     for serial_char in stim_dic[round_time]:
+                        print(round_time)
                         arduino.write(serial_char.encode('ascii'))
-            last_time = self.switch_signal(arduino, ["w","x"], 1, last_time)
+                        if serial_char in self.signal_tracker:
+                            self.signal_tracker.remove(serial_char)
+                        else:
+                            self.signal_tracker.add(serial_char)
+            if len(set(self.signal_list) & self.signal_tracker) == 1:
+                self.switch_signal(arduino, "xw", self.switch_duration, last_time)
+            # Update recording tracker to exit the loop after recording turns off
+            if (self.recording) and recording_tracker == 0:
+                recording_tracker = 1
+            elif (not self.recording) and recording_tracker == 1:
+                recording_tracker = 2
             time.sleep(delay)
+        recording_tracker = 0
+        arduino.write(self.shutdown.encode('ascii'))
         arduino.close()
 
     def run_arduino(self):
@@ -332,7 +354,7 @@ class EZMiceApp:
         P: None. Reads self.chamber_number and self.animal_tag.
         """
         now = datetime.datetime.now()
-        return f"/Chamber{self.chamber_number.get()}_Tag{self.animal_tag.get()}_{now.strftime('%Y%m%d_%H%M%S')}"
+        return f"/Chamber{self.chamber_number.get()}_Tag{self.animal_tag.get()}_{now.strftime('%Y-%m-%d_%H:%M:%S')}"
 
     def toggle_record(self):
         """
@@ -388,23 +410,28 @@ class EZMiceApp:
         self.frame_rate = 2 if self.extended_assay.get() else 30
 
         with picamera.PiCamera() as camera:
-            camera.resolution = (1296, 972)
+            camera.resolution = (1296,972)
             camera.framerate = self.frame_rate
             camera.exposure_mode = 'off'
             camera.awb_mode = 'off'
             camera.awb_gains = self.awbgains
             camera.shutter_speed = self.shutter
             camera.iso = 100
-            camera.zoom = (0.39, 0.3, 0.25, 0.25)
+            #camera.zoom = (0.39, 0.3, 0.25, 0.25)
 
-            camera.start_preview()
             self.run_arduino()
+            time.sleep(2)
+            start_time = time.monotonic()
+            camera.start_preview()
+            while (self.scheduled_start.get() != "" and (datetime.datetime.now().hour() + 
+                                                     datetime.datetime.now().minute()/100.0) != float(self.scheduled_start.get())):
+                time.sleep(0.1)
+            filename = save_dir + self.get_filename()
             camera.start_recording("{0}.h264".format(filename))
             self.master.after(0, lambda: self.info_label.config(text=f"Recording to {filename}"))
-            elapsed = 0
-            while self.recording and elapsed <= int(self.record_duration.get()):
-                camera.wait_recording(1)
-                elapsed += 1
+
+            while self.recording and time.monotonic() - start_time < int(self.record_duration.get()):
+                camera.wait_recording(0.1)
 
             camera.stop_recording()
             camera.stop_preview()
@@ -456,7 +483,7 @@ class EZMiceApp:
 
         # Otsu supplies the Canny thresholds; the binary image itself is discarded.
         otsu_thresh, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        edged1 = cv2.Canny(blurred, int(otsu_thresh/12), int(otsu_thresh/5))
+        edged1 = cv2.Canny(blurred, int(otsu_thresh/14), int(otsu_thresh/5.5))
 
         contours1, _ = cv2.findContours(edged1.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         # Thick white redraw turns a broken rim into a solid band for the close.
@@ -552,6 +579,7 @@ class EZMiceApp:
 
         # 8 rows (A-H) by 12 columns, inset by the margins. The outer edge of
         # the last well lands on target - margin, inside the warped image.
+
         row_step = (self.target_height - 2*self.pmarg_y) / 8.0
         col_step = (self.target_width - 2*self.pmarg_x) / 12.0
         well_boxes = []
@@ -573,8 +601,8 @@ class EZMiceApp:
             # Binary motion mask, written beside the source MP4.
             # Playback rate is fixed at 30 even when the assay was captured at 2.
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            analysis_path = video_path.replace(".mp4", "_analysis.avi")
-            analysis_writer = cv2.VideoWriter(analysis_path, fourcc, 30, (self.target_width,self.target_height))
+            analysis_path = video_path.replace(".mp4", ".avi")
+            analysis_writer = cv2.VideoWriter(analysis_path, fourcc, self.frame_rate, (self.target_width,self.target_height))
 
             frame_idx = 0
             while cap.isOpened():
@@ -592,7 +620,9 @@ class EZMiceApp:
                 diff = cv2.absdiff(warp_frame, prev_warp)
                 _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
                 thresh_color = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-                analysis_writer.write(thresh_color)
+
+                analysis_writer.write(thresh_color) ###thresh_color
+
                 row_data = [frame_idx, round(current_time, 3)]
                 for r, c, x1, y1, x2, y2 in well_boxes:
                     well_roi = thresh[y1:y2, x1:x2]
@@ -676,11 +706,11 @@ class EZMiceApp:
                 camera.awb_mode = 'auto'
                 camera.framerate = self.frame_rate
                 camera.iso = 100
-                camera.zoom = (0.39, 0.3, 0.25, 0.25)
+                #camera.zoom = (0.39, 0.3, 0.25, 0.25)
                 # Let auto AWB and auto shutter settle, then pin both.
                 time.sleep(5/self.frame_rate)
                 self.awbgains = camera.awb_gains
-                self.shutter = camera.exposure_speed - 100
+                self.shutter = camera.exposure_speed
                 camera.awb_mode = 'off'
                 camera.exposure_mode = 'off'
                 camera.awb_gains = self.awbgains
@@ -689,7 +719,7 @@ class EZMiceApp:
                 print(self.shutter)
 
                 camera.start_preview()
-                time.sleep(5)
+                input("")
                 camera.stop_preview()
                 camera.capture(image_path)
 
@@ -715,7 +745,7 @@ class EZMiceApp:
                 x = int(c * col_step) + self.pmarg_x
                 cv2.line(warped, (x, 0), (x, self.target_height), (0, 150, 255 if c%12==0 else 0), 2)
 
-            cv2.imwrite(preview_path, warped) #####warped
+            cv2.imwrite(preview_path, gray) #####warped
             ###pil_img = Image.open(preview_path)
             #Image.open(preview_path).show()
             pil_img = Image.open(preview_path).resize((640,400), Image.LANCZOS)
@@ -758,4 +788,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
