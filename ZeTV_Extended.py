@@ -728,7 +728,11 @@ class EZMiceApp:
                 print(self.shutter)
 
                 camera.start_preview()
-                input("")
+                while True:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (13, 32):  # Enter or Space key
+                        break
+                    time.sleep(0.1)
                 camera.stop_preview()
                 camera.capture(image_path)
 
