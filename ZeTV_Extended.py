@@ -77,7 +77,8 @@ class EZMiceApp:
         self.stim_set = tk.StringVar()
         self.scheduled_start = tk.StringVar()
         self.shutdown = 'c'
-        self.signal_tracker = {}
+        self.signal_tracker = set()
+        self.signal_list = "xw"
 
         # Source-image corners (TL, TR, BR, BL) and the rectangle they warp into.
         self.plate_corners = np.float32([[100, 100], [1196, 100], [1196, 872], [100, 872]])
@@ -239,24 +240,26 @@ class EZMiceApp:
         except Exception as e:
             messagebox.showerror("Error", f"Stimulus set input error: {e}")
         return stim_dic
-    def switch_signal(self, arduino, signal_list, duration, last_time):
-        """
-        B: Switches the specified signals for a given duration.
-        E: None.
-        R: None.
-        P: None.
-        """
-        if time.perf_counter() - last_time >= duration:
-            last_time = time.perf_counter()
-            #signal_list.append(signal_list.pop(0))
-            #Last list item is the signal currently "on",
-            #first list item is next one to be turned "on"
-            arduino.write(signal_list[0].encode('ascii'))
-            self.signal_tracker.add(signal_list[0])
-            arduino.write(signal_list[len(signal_list) - 1].encode('ascii'))
-            self.signal_tracker.remove(signal_list[len(signal_list) - 1])
-            signal_list = signal_list[1:] + [signal_list[0]]
-        return last_time
+        
+    def switch_signal(self, arduino, duration, last_time):
+           """
+           B: Switches the specified signals for a given duration.
+           E: None.
+           R: None.
+           P: None.
+           """
+           if time.perf_counter() - last_time >= duration:
+               last_time = time.perf_counter()
+               #signal_list.append(signal_list.pop(0))
+               #Last list item is the signal currently "on",
+               #first list item is next one to be turned "on"
+               arduino.write(self.signal_list[0].encode('ascii'))
+               self.signal_tracker.add(self.signal_list[0])
+               arduino.write(self.signal_list[len(self.signal_list) - 1].encode('ascii'))
+               self.signal_tracker.remove(self.signal_list[len(self.signal_list) - 1])
+               self.signal_list = self.signal_list[1:] + self.signal_list[0]
+           return last_time
+
     def send_serial(self):
         """
         B: Writes stimulus characters to the Arduino while a recording runs.
@@ -287,31 +290,37 @@ class EZMiceApp:
         stim_dic = self.build_stim_dic()
         last_time = time.perf_counter()
         recording_tracker = 0
+        self.signal_list = "xw"
 
         # Fire once per new key, not once per loop iteration.
         while recording_tracker < 2:
             if self.extended_assay.get():
                 current_round_time = datetime.datetime.now().hour + datetime.datetime.now().minute / 100.0
             else:
-                current_round_time = int((time.perf_counter() - arduino_start) / delay) * delay
+                current_round_time = round(int((time.perf_counter() - arduino_start) / delay) * delay, 2)
             if round_time != current_round_time:
                 round_time = current_round_time
                 if round_time in stim_dic:
                     for serial_char in stim_dic[round_time]:
                         print(round_time)
-                        arduino.write(serial_char.encode('ascii'))
+                        print(serial_char.encode('ascii'))
                         if serial_char in self.signal_tracker:
                             self.signal_tracker.remove(serial_char)
                         else:
                             self.signal_tracker.add(serial_char)
             if len(set(self.signal_list) & self.signal_tracker) == 1:
-                self.switch_signal(arduino, "xw", self.switch_duration, last_time)
-            # Update recording tracker to exit the loop after recording turns off
-            if (self.recording) and recording_tracker == 0:
-                recording_tracker = 1
-            elif (not self.recording) and recording_tracker == 1:
-                recording_tracker = 2
-            time.sleep(delay)
+                last_time = self.switch_signal(2, last_time)
+            else:
+                for serial_char in self.signal_list:
+                    if serial_char in self.signal_tracker:
+                        print(serial_char.encode('ascii'))
+                        self.signal_tracker.remove(serial_char)
+        # Update recording tracker to exit the loop after recording turns off
+        if (self.recording) and recording_tracker == 0:
+            recording_tracker = 1
+        elif (not self.recording) and recording_tracker == 1:
+            recording_tracker = 2
+        time.sleep(delay)
         recording_tracker = 0
         arduino.write(self.shutdown.encode('ascii'))
         arduino.close()
@@ -423,8 +432,8 @@ class EZMiceApp:
             time.sleep(2)
             start_time = time.monotonic()
             camera.start_preview()
-            while (self.scheduled_start.get() != "" and (datetime.datetime.now().hour() + 
-                                                     datetime.datetime.now().minute()/100.0) != float(self.scheduled_start.get())):
+            while (self.scheduled_start.get() != "" and round((datetime.datetime.now().hour + 
+                                                     datetime.datetime.now().minute/100.0),2) != float(self.scheduled_start.get())):
                 time.sleep(0.1)
             filename = save_dir + self.get_filename()
             camera.start_recording("{0}.h264".format(filename))

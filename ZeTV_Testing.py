@@ -76,7 +76,7 @@ class EZMiceApp:
         self.stim_set = tk.StringVar()
         self.scheduled_start = tk.StringVar()
         self.shutdown = 'c'
-        self.signal_tracker = {}
+        self.signal_tracker = set()
 
         # Source-image corners (TL, TR, BR, BL) and the rectangle they warp into.
         self.plate_corners = np.float32([[100, 100], [1196, 100], [1196, 872], [100, 872]])
@@ -168,6 +168,17 @@ class EZMiceApp:
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_x))
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_y))
 
+        # Color mapping for stimulus / solenoid overlay (BGR format)
+        self.stim_colors = {
+            'w': (255, 255, 255),  # White
+            'v': (211, 0, 148),    # Violet (approximate BGR)
+            'x': (200, 200, 200),  # Auxiliary White (Light Gray)
+            'r': (0, 0, 255),      # Red
+            'g': (0, 255, 0),      # Green
+            's': (255, 165, 0),    # Soft tap solenoid (Blue/Orange-ish or Cyan)
+            'h': (0, 69, 255)      # Hard tap solenoid (Deep Orange / Red-Orange)
+        }
+
     def toggle_coords(self):
         """
         B: Shows or hides the eight manual corner entries. When Manual is on,
@@ -201,7 +212,57 @@ class EZMiceApp:
         ])
         matrix = cv2.getPerspectiveTransform(self.plate_corners, dst_pts)
         return cv2.warpPerspective(img, matrix, (self.target_width, self.target_height))
-
+    
+    def draw_status_overlay(self, frame):
+        """
+        B: Draws a status HUD overlay on the frame showing active stimulus/solenoid states.
+        E: None.
+        R: Frame with overlay rendered.
+        P: frame - BGR image to draw on.
+        """
+        # Background panel for HUD
+        overlay = frame.copy()
+        h_f, w_f = frame.shape[:2]
+        
+        # Draw a semi-transparent header box or sidebar tracker
+        cv2.rectangle(overlay, (10, 10), (320, 50 + len(self.stim_colors) * 25), (30, 30, 30), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        
+        # Title
+        cv2.putText(frame, "STIMULUS & SOLENOID STATUS", (20, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        
+        # Legend labels and live active status indicators
+        labels = {
+            'w': 'White Light (w)',
+            'v': 'Violet Light (v)',
+            'x': 'Aux White (x)',
+            'r': 'Red Light (r)',
+            'g': 'Green Light (g)',
+            's': 'Soft Tap Solenoid (s)',
+            'h': 'Hard Tap Solenoid (h)'
+        }
+        
+        y_offset = 55
+        for key, label_text in labels.items():
+            is_active = key in self.signal_tracker
+            color = self.stim_colors.get(key, (255, 255, 255))
+            
+            # Draw indicator circle (Filled if active, hollow ring if inactive)
+            circle_color = color if is_active else (80, 80, 80)
+            thickness = -1 if is_active else 1
+            cv2.circle(frame, (35, y_offset - 4), 8, circle_color, thickness)
+            cv2.circle(frame, (35, y_offset - 4), 8, (200, 200, 200), 1) # border ring
+            
+            # Draw text label
+            text_color = (255, 255, 255) if is_active else (150, 150, 150)
+            cv2.putText(frame, label_text, (55, y_offset), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1, cv2.LINE_AA)
+            
+            y_offset += 25
+            
+        return frame
+    
     def build_stim_dic(self):
         """
         B: Turns the Stimulus Set field into {time_key: command_characters}.
@@ -238,7 +299,7 @@ class EZMiceApp:
         except Exception as e:
             messagebox.showerror("Error", f"Stimulus set input error: {e}")
         return stim_dic
-    def switch_signal(self, arduino, signal_list, duration, last_time):
+    def switch_signal(self, duration, last_time):
         """
         B: Switches the specified signals for a given duration.
         E: None.
@@ -250,11 +311,11 @@ class EZMiceApp:
             #signal_list.append(signal_list.pop(0))
             #Last list item is the signal currently "on",
             #first list item is next one to be turned "on"
-            arduino.write(signal_list[0].encode('ascii'))
-            self.signal_tracker.add(signal_list[0])
-            arduino.write(signal_list[len(signal_list) - 1].encode('ascii'))
-            self.signal_tracker.remove(signal_list[len(signal_list) - 1])
-            signal_list = signal_list[1:] + [signal_list[0]]
+            print(self.signal_list[0].encode('ascii'))
+            self.signal_tracker.add(self.signal_list[0])
+            print(self.signal_list[len(self.signal_list) - 1].encode('ascii'))
+            self.signal_tracker.remove(self.signal_list[len(self.signal_list) - 1])
+            self.signal_list = self.signal_list[1:] + self.signal_list[0]
         return last_time
     def send_serial(self):
         """
@@ -274,7 +335,7 @@ class EZMiceApp:
         P: None. Reads self.scheduled_start, self.recording, self.extended_assay, and the stimulus field.
         """
         try:
-            arduino = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
+            #arduino = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
             time.sleep(2)
         except Exception as e:
             messagebox.showerror("Error", f"Could not connect to Arduino: {e}")
@@ -286,25 +347,31 @@ class EZMiceApp:
         stim_dic = self.build_stim_dic()
         last_time = time.perf_counter()
         recording_tracker = 0
+        self.signal_list = "xw"
 
         # Fire once per new key, not once per loop iteration.
         while recording_tracker < 2:
             if self.extended_assay.get():
                 current_round_time = datetime.datetime.now().hour + datetime.datetime.now().minute / 100.0
             else:
-                current_round_time = int((time.perf_counter() - arduino_start) / delay) * delay
+                current_round_time = round(int((time.perf_counter() - arduino_start) / delay) * delay, 2)
             if round_time != current_round_time:
                 round_time = current_round_time
                 if round_time in stim_dic:
                     for serial_char in stim_dic[round_time]:
                         print(round_time)
-                        arduino.write(serial_char.encode('ascii'))
+                        print(serial_char.encode('ascii'))
                         if serial_char in self.signal_tracker:
                             self.signal_tracker.remove(serial_char)
                         else:
                             self.signal_tracker.add(serial_char)
             if len(set(self.signal_list) & self.signal_tracker) == 1:
-                self.switch_signal(arduino, "xw", self.switch_duration, last_time)
+                last_time = self.switch_signal(2, last_time)
+            else:
+                for serial_char in self.signal_list:
+                    if serial_char in self.signal_tracker:
+                        print(serial_char.encode('ascii'))
+                        self.signal_tracker.remove(serial_char)
             # Update recording tracker to exit the loop after recording turns off
             if (self.recording) and recording_tracker == 0:
                 recording_tracker = 1
@@ -312,8 +379,8 @@ class EZMiceApp:
                 recording_tracker = 2
             time.sleep(delay)
         recording_tracker = 0
-        arduino.write(self.shutdown.encode('ascii'))
-        arduino.close()
+        print(self.shutdown.encode('ascii'))
+        #arduino.close()
 
     def run_arduino(self):
         """
@@ -384,30 +451,13 @@ class EZMiceApp:
         else:
             self.recording = False
             self.record_button.config(text='Record & Analyze')
+
     def record_with_preview(self):
         save_dir = self.save_path.get()
         fileType = ".mp4"
         self.frame_rate = 2 if self.extended_assay.get() else 30
 
-        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-
-        # Resolution and frame rate
-        width, height = 1296, 972
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, self.frame_rate)
-
-        # Disable auto exposure and set manual shutter speed
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-        cap.set(cv2.CAP_PROP_EXPOSURE, self.shutter - 10000)
-
-        # Disable auto white balance and set manual temperature
-        cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-        cap.set(cv2.CAP_PROP_WB_TEMPERATURE, self.awbgains)
-
-        # Gain / ISO equivalent
-        cap.set(cv2.CAP_PROP_ISO_SPEED, 100)
-
+        cap = cv2.VideoCapture(0)
         cv2.namedWindow("Camera Preview", cv2.WINDOW_NORMAL)
 
         try:
@@ -433,7 +483,7 @@ class EZMiceApp:
 
             # OpenCV writes directly to MP4 (replaces .h264 recording + ffmpeg remux)
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(mp4_path, fourcc, self.frame_rate, (width, height))
+            out = cv2.VideoWriter(mp4_path, fourcc, self.frame_rate, (1296, 972))
 
             self.master.after(0, lambda: self.info_label.config(text=f"Recording to {filename}"))
 
@@ -446,12 +496,11 @@ class EZMiceApp:
                 ret, frame = cap.read()
                 if not ret:
                     break
+                # Apply live overlay to preview
+                display_frame = self.draw_status_overlay(frame.copy())
 
-                # Optional: apply plate zoom crop here before writing/showing
-                # frame = frame[int(0.3*height):int(0.55*height), int(0.39*width):int(0.64*width)]
-
-                out.write(frame)
-                cv2.imshow("Camera Preview", frame)
+                out.write(frame)  # Write raw or with overlay depending on your preference
+                cv2.imshow("Camera Preview", display_frame)
                 cv2.waitKey(1)
 
             # Replaces stop_recording()
@@ -655,93 +704,95 @@ class EZMiceApp:
         self.master.after(0, lambda: self.info_label.config(text=f"Analysis complete! Saved: {os.path.basename(output_csv_path)}"))
 
     def capture_and_display(self):
-        """
-        B: Grabs one still at 1296x972 with the plate zoom and shows it in a
-           640x400 popup. The file is <save folder>/image.jpg. When Manual is
-           on, a 50-pixel grid is drawn on that still first and the popup
-           title says the grid is shown. White balance and shutter are left
-           at the camera defaults.
-        E: Capture and display failures are caught, shown in an error dialog,
-           and not re-raised.
-        R: None.
-        P: None. Reads self.save_path and self.manual_cal.
-        """
         try:
-            with picamera.PiCamera() as camera:
-                image_path = self.save_path.get() + '/image.jpg'
-                camera.resolution = (1296, 972)
-                camera.zoom = (0.39, 0.3, 0.25, 0.25)
-                camera.capture(image_path)
+            image_path = os.path.join(self.save_path.get(), 'image.jpg')
+            width, height = 1296, 972
+
+            cap = cv2.VideoCapture(0)
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+                # Flush a few initial frames so auto-exposure/AWB can settle
+                for _ in range(5):
+                    ret, frame = cap.read()
+
+                if not ret or frame is None:
+                    raise RuntimeError("Failed to grab frame from camera.")
+            finally:
+                cap.release()
+
+            # Replicate camera.zoom = (0.39, 0.3, 0.25, 0.25)
+            x, y = int(0.39 * width), int(0.3 * height)
+            zw, zh = int(0.25 * width), int(0.25 * height)
+            cropped = frame[y:y+zh, x:x+zw]
+
+            # Upscale crop back to 1296x972 (matches picamera's output resolution & grid coordinates)
+            grid_img = cv2.resize(cropped, (width, height), interpolation=cv2.INTER_LINEAR)
+
             # Drawing grid overlay for coordinate finding in manual calibration mode
             if self.manual_cal.get():
-                grid_img = cv2.imread(image_path)
                 step_size = 50
-                for y in range(6):
-                    color = (0, 255-30*y, 30*y)
-                    cv2.line(grid_img, (0, y*step_size), (1296, y*step_size), color, 4)
-                    cv2.line(grid_img, (0, 972 - y*step_size), (1296, 972 - y*step_size), color, 4)
-                for x in range(6):
-                    color = (0, 255-40*y, 40*x)
-                    cv2.line(grid_img, (x*step_size, 0), (x*step_size, 972), color, 4)
-                    cv2.line(grid_img, (1296 - x*step_size, 0), (1296 - x*step_size, 972), color, 4)
-                    cv2.imwrite(image_path, grid_img)
-            pil_img = Image.open(image_path).resize((640,400), Image.LANCZOS)
+                for y_idx in range(6):
+                    color = (0, 255 - 30 * y_idx, 30 * y_idx)
+                    cv2.line(grid_img, (0, y_idx * step_size), (width, y_idx * step_size), color, 4)
+                    cv2.line(grid_img, (0, height - y_idx * step_size), (width, height - y_idx * step_size), color, 4)
+                for x_idx in range(6):
+                    color = (0, 255 - 40 * y_idx, 40 * x_idx)
+                    cv2.line(grid_img, (x_idx * step_size, 0), (x_idx * step_size, height), color, 4)
+                    cv2.line(grid_img, (width - x_idx * step_size, 0), (width - x_idx * step_size, height), color, 4)
+
+            # Save final still to disk
+            cv2.imwrite(image_path, grid_img)
+
+            # Convert BGR (OpenCV) to RGB (PIL) for Tkinter display
+            rgb_img = cv2.cvtColor(grid_img, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb_img).resize((640, 400), Image.LANCZOS)
+
             popup = tk.Toplevel(self.master)
             popup.title("Captured Image" + (" (Grid Shown)" if self.manual_cal.get() else " (No Grid)"))
             tk_img = ImageTk.PhotoImage(pil_img)
             popup_label = ttk.Label(popup, image=tk_img)
             popup_label.image = tk_img  # Keep reference to prevent garbage collection!
             popup_label.pack(padx=10, pady=10)
+
         except Exception as e:
             messagebox.showerror("Error", f"Could not capture image: {e}")
 
+
     def capture_and_calibrate(self):
-        """
-        B: Samples white balance and shutter speed, detects the plate, and
-           previews the 8x12 grid. Auto white balance and backlight exposure
-           run for 2 seconds; awb_gains and shutter are then frozen onto self.
-           Exposure is switched off and the shutter is shortened by 100
-           microseconds for the still. After a 5 second preview it captures
-           1296x972 with the plate zoom. Corner detection draws on that frame
-           (or copies the manual entries); the result is warped and a 9-by-13
-           line grid is drawn on top. Outer boundary lines are orange; inner
-           lines are green. The preview is shown from the JPEG, then both
-           temporary JPEGs are deleted. time.sleep(1) runs on the Tk thread,
-           so the window paints after return. Recording later uses this
-           shutter minus another 10000 microseconds.
-        E: Capture, load, and preview failures are caught, shown in an error
-           dialog, and not re-raised. A missing image file returns from its own
-           dialog before the temporary files are deleted.
-        R: None. On the success path, self.plate_corners, self.awbgains, and self.shutter are updated.
-        P: None. Reads self.save_path and the plate geometry fields.
-        """
         try:
-            image_path = self.save_path.get() + '/calibration_capture.jpg'
-            preview_path = self.save_path.get()  + '/calibrated_plate_preview.jpg'
+            image_path = os.path.join(self.save_path.get(), 'calibration_capture.jpg')
+            preview_path = os.path.join(self.save_path.get(), 'calibrated_plate_preview.jpg')
+            width, height = 1296, 972
 
-            with picamera.PiCamera() as camera:
-                camera.resolution = (int(1296), int(972))
-                camera.exposure_mode = 'backlight' #auto
-                camera.awb_mode = 'auto'
-                camera.framerate = self.frame_rate
-                camera.iso = 100
-                #camera.zoom = (0.39, 0.3, 0.25, 0.25)
-                # Let auto AWB and auto shutter settle, then pin both.
-                time.sleep(5/self.frame_rate)
-                self.awbgains = camera.awb_gains
-                self.shutter = camera.exposure_speed
-                camera.awb_mode = 'off'
-                camera.exposure_mode = 'off'
-                camera.awb_gains = self.awbgains
-                camera.shutter_speed = self.shutter
-                print(self.awbgains)
-                print(self.shutter)
+            cap = cv2.VideoCapture(0)
+            try:
+                # Live preview loop: press Enter (13) or Space (32) in the window to capture
+                cv2.namedWindow("Calibration Preview - Press SPACE or ENTER to capture", cv2.WINDOW_NORMAL)
+                frame = None
+                while True:
+                    ret, current_frame = cap.read()
+                    if ret:
+                        frame = current_frame
+                        cv2.imshow("Calibration Preview - Press SPACE or ENTER to capture", frame)
 
-                camera.start_preview()
-                input("")
-                camera.stop_preview()
-                camera.capture(image_path)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (13, 32):  # Enter or Space key
+                        break
 
+                cv2.destroyAllWindows()
+
+                if frame is None:
+                    messagebox.showerror("Error", "Failed to capture calibration image.")
+                    return
+
+                # Save raw capture (preserving your exact disk flow)
+                cv2.imwrite(image_path, frame)
+
+            finally:
+                cap.release()
+                cv2.destroyAllWindows()
 
             img = cv2.imread(image_path)
             if img is None:
@@ -751,23 +802,20 @@ class EZMiceApp:
             gray = self.find_plate_corners(img)
             warped = self.apply_warp(gray)
 
-            # Inset grid: 8 rows need 9 lines, 12 columns need 13. The step is
-            # (target - 2*margin) so the outer lines sit margin pixels inward.
-            row_step = (self.target_height-2*self.pmarg_y) / 8.0
-            col_step = (self.target_width-2*self.pmarg_x)/ 12.0
+            # Inset grid: 8 rows need 9 lines, 12 columns need 13.
+            row_step = (self.target_height - 2 * self.pmarg_y) / 8.0
+            col_step = (self.target_width - 2 * self.pmarg_x) / 12.0
 
             for r in range(9):
                 y = int(r * row_step) + self.pmarg_y
-                cv2.line(warped, (0, y), (self.target_width, y), (0, 150, 255 if r%8==0 else 0), 2)
+                cv2.line(warped, (0, y), (self.target_width, y), (0, 150, 255 if r % 8 == 0 else 0), 2)
 
             for c in range(13):
                 x = int(c * col_step) + self.pmarg_x
-                cv2.line(warped, (x, 0), (x, self.target_height), (0, 150, 255 if c%12==0 else 0), 2)
+                cv2.line(warped, (x, 0), (x, self.target_height), (0, 150, 255 if c % 12 == 0 else 0), 2)
 
-            cv2.imwrite(preview_path, gray) #####warped
-            ###pil_img = Image.open(preview_path)
-            #Image.open(preview_path).show()
-            pil_img = Image.open(preview_path).resize((640,400), Image.LANCZOS)
+            cv2.imwrite(preview_path, gray)  #####warped
+            pil_img = Image.open(preview_path).resize((640, 400), Image.LANCZOS)
 
             popup = tk.Toplevel(self.master)
             popup.title("Plate Calibration Preview")
@@ -778,8 +826,6 @@ class EZMiceApp:
             popup_label.image = tk_img  # Keep reference to prevent garbage collection!
             popup_label.pack(padx=10, pady=10)
 
-            #ttk.Button(popup, text="Close", command=popup.destroy).pack(pady=5)
-            # -------------------------------------------------------
             time.sleep(1)
             for path in (image_path, preview_path):
                 if os.path.exists(path):
@@ -791,6 +837,7 @@ class EZMiceApp:
 
         except Exception as e:
             messagebox.showerror("Error", f"Calibration capture failed: {e}")
+
 
 def main():
     """
