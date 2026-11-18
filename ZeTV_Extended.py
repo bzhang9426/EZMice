@@ -335,6 +335,7 @@ class EZMiceApp:
                 if round_time in stim_dic:
                     for serial_char in stim_dic[round_time]:
                         print(round_time)
+                        print(arduino.write(serial_char.encode('ascii')))
                         arduino.write(serial_char.encode('ascii'))
                         if serial_char in self.signal_tracker:
                             self.signal_tracker.remove(serial_char)
@@ -354,6 +355,8 @@ class EZMiceApp:
                 recording_tracker = 2
             time.sleep(delay)
         recording_tracker = 0
+        self.signal_tracker.clear()
+        self.signal_list = "xw"
         arduino.write(self.shutdown.encode('ascii'))
         arduino.close()
 
