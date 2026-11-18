@@ -341,9 +341,11 @@ class EZMiceApp:
                         print(round_time)
                         print(serial_char.encode('ascii'))
                         if serial_char in self.signal_tracker:
-                            self.signal_tracker.remove(serial_char)
+                            #self.signal_tracker.remove(serial_char)
+                            pass
                         else:
-                            self.signal_tracker.add(serial_char)
+                            pass
+                            #self.signal_tracker.add(serial_char)
 
             if len(set(self.signal_list) & self.signal_tracker) == 1:
                 last_time = self.switch_signal(2, last_time)

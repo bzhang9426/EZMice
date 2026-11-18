@@ -66,11 +66,13 @@ class EZMiceApp:
         self.style.theme_use('clam')
 
         # Operator form. Read at record time; nothing is validated until then.
+        self.camera = None
         self.record_duration = tk.StringVar()
         self.chamber_number = tk.StringVar()
         self.animal_tag = tk.StringVar()
         self.save_path = tk.StringVar()
         self.recording = False
+        self.preview_open = tk.IntVar()  # 0 = closed, 1 = open
         # 0 = short assay at 30 fps, 1 = extended assay at 2 fps.
         self.extended_assay = tk.IntVar() # 0 "short" or 1 "extended"
         # Stimulus schedule text ("time:chars,...") and the serial tick length.
@@ -170,6 +172,9 @@ class EZMiceApp:
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_x))
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_y))
 
+        # Preview toggle
+        ttk.Checkbutton(self.master, text="Preview", variable=self.preview_open, command=self.toggle_preview).grid(row=8, column=3, padx=5, pady=2)
+        
     def toggle_coords(self):
         """
         B: Shows or hides the eight manual corner entries. When Manual is on,
@@ -184,6 +189,26 @@ class EZMiceApp:
                 entry.grid(row=int(i/4 - 1 + 9), column=int(i%4), padx=5, pady=2)
             else:
                 entry.grid_remove()
+
+    def toggle_preview(self):
+        try:
+            if not self.preview_open.get():
+
+                if self.camera is None:
+                    self.camera = picamera.PiCamera()
+
+                self.camera.start_preview()
+                self.preview_open.set(1)
+
+            else:
+
+                if self.camera is not None:
+                    self.camera.stop_preview()
+
+                self.preview_open.set(0)
+
+        except Exception as e:
+            print(f"Error occurred while toggling preview: {e}")
 
     def apply_warp(self, img):
         """
@@ -290,7 +315,6 @@ class EZMiceApp:
         stim_dic = self.build_stim_dic()
         last_time = time.perf_counter()
         recording_tracker = 0
-        self.signal_list = "xw"
 
         # Fire once per new key, not once per loop iteration.
         while recording_tracker < 2:
@@ -303,7 +327,7 @@ class EZMiceApp:
                 if round_time in stim_dic:
                     for serial_char in stim_dic[round_time]:
                         print(round_time)
-                        print(serial_char.encode('ascii'))
+                        arduino.write(serial_char.encode('ascii'))
                         if serial_char in self.signal_tracker:
                             self.signal_tracker.remove(serial_char)
                         else:
@@ -311,16 +335,16 @@ class EZMiceApp:
             if len(set(self.signal_list) & self.signal_tracker) == 1:
                 last_time = self.switch_signal(2, last_time)
             else:
-                for serial_char in self.signal_list:
-                    if serial_char in self.signal_tracker:
-                        print(serial_char.encode('ascii'))
-                        self.signal_tracker.remove(serial_char)
-        # Update recording tracker to exit the loop after recording turns off
-        if (self.recording) and recording_tracker == 0:
-            recording_tracker = 1
-        elif (not self.recording) and recording_tracker == 1:
-            recording_tracker = 2
-        time.sleep(delay)
+                for off_char in self.signal_list:
+                    if off_char in self.signal_tracker:
+                        arduino.write(off_char.encode('ascii'))
+                        self.signal_tracker.remove(off_char)
+            # Update recording tracker to exit the loop after recording turns off
+            if self.recording and recording_tracker == 0:
+                recording_tracker = 1
+            elif (not self.recording) and recording_tracker == 1:
+                recording_tracker = 2
+            time.sleep(delay)
         recording_tracker = 0
         arduino.write(self.shutdown.encode('ascii'))
         arduino.close()
@@ -419,6 +443,7 @@ class EZMiceApp:
         self.frame_rate = 2 if self.extended_assay.get() else 30
 
         with picamera.PiCamera() as camera:
+            self.camera = camera
             camera.resolution = (1296,972)
             camera.framerate = self.frame_rate
             camera.exposure_mode = 'off'
@@ -431,7 +456,7 @@ class EZMiceApp:
             self.run_arduino()
             time.sleep(2)
             start_time = time.monotonic()
-            camera.start_preview()
+            self.toggle_preview()  # Start preview if not already open
             while (self.scheduled_start.get() != "" and round((datetime.datetime.now().hour + 
                                                      datetime.datetime.now().minute/100.0),2) != float(self.scheduled_start.get())):
                 time.sleep(0.1)
@@ -443,7 +468,7 @@ class EZMiceApp:
                 camera.wait_recording(0.1)
 
             camera.stop_recording()
-            camera.stop_preview()
+            self.toggle_preview()  # Stop preview if not already closed
 
             if self.recording:
                 self.master.after(0, lambda: self.info_label.config(text=f"Video saved to {filename}"))
@@ -658,6 +683,7 @@ class EZMiceApp:
         """
         try:
             with picamera.PiCamera() as camera:
+                self.camera = camera
                 image_path = self.save_path.get() + '/image.jpg'
                 camera.resolution = (1296, 972)
                 camera.zoom = (0.39, 0.3, 0.25, 0.25)
@@ -710,6 +736,7 @@ class EZMiceApp:
             preview_path = self.save_path.get()  + '/calibrated_plate_preview.jpg'
 
             with picamera.PiCamera() as camera:
+                self.camera = camera
                 camera.resolution = (int(1296), int(972))
                 camera.exposure_mode = 'backlight' #auto
                 camera.awb_mode = 'auto'
@@ -727,15 +754,11 @@ class EZMiceApp:
                 print(self.awbgains)
                 print(self.shutter)
 
-                camera.start_preview()
-                while True:
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (13, 32):  # Enter or Space key
-                        break
+                self.toggle_preview()
+                while (self.preview_open.get()):
                     time.sleep(0.1)
-                camera.stop_preview()
-                camera.capture(image_path)
 
+                camera.capture(image_path)
 
             img = cv2.imread(image_path)
             if img is None:
