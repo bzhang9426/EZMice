@@ -81,12 +81,16 @@ class EZMiceApp:
         self.scheduled_start = tk.StringVar()
         self.shutdown = 'c'
         self.signal_tracker = set()
-        self.signal_list = "xw"
+        self.signal_input = tk.StringVar()
+        self.signal_list = ""
 
         # Source-image corners (TL, TR, BR, BL) and the rectangle they warp into.
         self.plate_corners = np.float32([[100, 100], [1196, 100], [1196, 872], [100, 872]])
         self.target_width = 600
         self.target_height = 400
+
+        # Video processing toggle:
+        self.processing_on = False
 
         # Manual corner entries. Hidden until the Manual checkbox is on.
         self.manual_cal = tk.IntVar()
@@ -130,7 +134,8 @@ class EZMiceApp:
         ttk.Label(self.master, text='Animal Tag:').grid(row=2, column=0, sticky='w', padx=5, pady=2)
         ttk.Label(self.master, text='Folder Path:').grid(row=3, column=0, sticky='w', padx=5, pady=2)
         ttk.Label(self.master, text='Stimulus Set:').grid(row=4, column=0, sticky='w', padx=5, pady=2)
-        ttk.Label(self.master, text='Scheduled Start Time (HH.MM):').grid(row=5, column=0, sticky='w', padx=5, pady=2)
+        ttk.Label(self.master, text='Signal Input:').grid(row=5, column=0, sticky='w', padx=5, pady=2)
+        ttk.Label(self.master, text='Scheduled Start Time (HH.MM):').grid(row=6, column=0, sticky='w', padx=5, pady=2)
 
         ttk.Checkbutton(self.master, text="Extended", variable=self.extended_assay).grid(row=0,column=2,padx=5,pady=2)
         self.duration_entry = ttk.Entry(self.master, textvariable=self.record_duration)
@@ -146,18 +151,22 @@ class EZMiceApp:
         self.stim_set_entry = ttk.Entry(self.master, textvariable=self.stim_set)
         self.stim_set_entry.grid(row=4, column=1, columnspan=2, sticky='ew', padx=5, pady=2)
 
+        # Signal list entry for the Arduino. Free text, parsed by send_serial.
+        self.signal_input = ttk.Entry(self.master, textvariable=self.stim_set)
+        self.signal_input.grid(row=5, column=1, sticky='ew', padx=5, pady=2)
+
         # Seconds between serial time checks. Empty means 0.05 in send_serial.
         self.start_entry = ttk.Entry(self.master, textvariable=self.scheduled_start)
-        self.start_entry.grid(row=5, column=1, sticky='w', padx=5, pady=2)
+        self.start_entry.grid(row=6, column=1, sticky='w', padx=5, pady=2)
 
         self.record_button = ttk.Button(self.master, text='Record & Analyze', command=self.toggle_record)
-        self.record_button.grid(row=6, column=0, sticky='ew', padx=5, pady=5)
+        self.record_button.grid(row=7, column=0, sticky='ew', padx=5, pady=5)
 
-        ttk.Button(self.master, text='Capture Image', command=self.capture_and_display).grid(row=6, column=2, sticky='ew', padx=5, pady=5)
-        ttk.Button(self.master, text='Capture & Calibrate Plate', command=self.capture_and_calibrate).grid(row=7, column=2, sticky='ew', padx=5, pady=5)
+        ttk.Button(self.master, text='Capture Image', command=self.capture_and_display).grid(row=7, column=2, sticky='ew', padx=5, pady=5)
+        ttk.Button(self.master, text='Capture & Calibrate Plate', command=self.capture_and_calibrate).grid(row=8, column=2, sticky='ew', padx=5, pady=5)
 
         self.info_label = ttk.Label(self.master, text='')
-        self.info_label.grid(row=7, column=0, columnspan=2, padx=5, pady=5)
+        self.info_label.grid(row=8, column=0, columnspan=2, padx=5, pady=5)
 
         self.image_label = ttk.Label(self.master)
         self.image_label.grid(row=9, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
@@ -174,8 +183,8 @@ class EZMiceApp:
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_y))
 
         # Preview toggle
-        ttk.Checkbutton(self.master, text="Preview", variable=self.preview_open, command=self.toggle_preview).grid(row=8, column=3, padx=5, pady=2)
-        
+        ttk.Checkbutton(self.master, text="Preview", variable=self.preview_open, command=self.toggle_preview).grid(row=6, column=1, padx=5, pady=2)
+        # Video processing toggle
     def toggle_coords(self):
         """
         B: Shows or hides the eight manual corner entries. When Manual is on,
@@ -187,7 +196,7 @@ class EZMiceApp:
         """
         for i, entry in enumerate(self.coord_entries):
             if (self.manual_cal.get()):
-                entry.grid(row=int(i/4 - 1 + 9), column=int(i%4), padx=5, pady=2)
+                entry.grid(row=int(i/4 - 1 + 10), column=int(i%4), padx=5, pady=2)
             else:
                 entry.grid_remove()
 
@@ -272,7 +281,7 @@ class EZMiceApp:
         except Exception as e:
             self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Stimulus set input error: {m}"))
         return stim_dic
-        
+
     def switch_signal(self, arduino, duration, last_time):
            """
            B: Switches the specified signals for a given duration.
@@ -316,7 +325,8 @@ class EZMiceApp:
         except Exception as e:
             self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Could not connect to Arduino: {m}"))
             return
-
+        
+        self.signal_list = self.signal_input.get() if self.signal_input.get() else ""
         round_time = -1
         arduino_start = time.perf_counter()
         delay = 0.05
@@ -334,8 +344,7 @@ class EZMiceApp:
                 round_time = current_round_time
                 if round_time in stim_dic:
                     for serial_char in stim_dic[round_time]:
-                        print(round_time)
-                        print(arduino.write(serial_char.encode('ascii')))
+                        print(str(round_time) + " " + serial_char)
                         arduino.write(serial_char.encode('ascii'))
                         if serial_char in self.signal_tracker:
                             self.signal_tracker.remove(serial_char)
@@ -356,7 +365,6 @@ class EZMiceApp:
             time.sleep(delay)
         recording_tracker = 0
         self.signal_tracker.clear()
-        self.signal_list = "xw"
         arduino.write(self.shutdown.encode('ascii'))
         arduino.close()
 
@@ -470,7 +478,7 @@ class EZMiceApp:
 
             with picamera.PiCamera() as camera:
                 self.camera = camera
-                camera.resolution = (1296,972)
+                camera.resolution = (1920,1080)
                 camera.framerate = self.frame_rate
                 camera.exposure_mode = 'off'
                 camera.awb_mode = 'off'
@@ -517,7 +525,7 @@ class EZMiceApp:
             command = f"ffmpeg -y -framerate {self.frame_rate} -i {filename}.h264 -c copy {filename}.mp4"
             call([command], shell=True)
 
-            if os.path.exists(filename + fileType):
+            if os.path.exists(filename + fileType) and self.processing_on:
                 self.process_video(filename + fileType, f"{filename}_motion_indices.csv")
 
         except Exception as e:
@@ -734,7 +742,6 @@ class EZMiceApp:
                 self.camera = camera
                 image_path = self.save_path.get() + '/image.jpg'
                 camera.resolution = (1296, 972)
-                camera.zoom = (0.39, 0.3, 0.25, 0.25)
                 camera.capture(image_path)
             self.camera = None   # don't leave a closed camera behind
             # Drawing grid overlay for coordinate finding in manual calibration mode
@@ -812,7 +819,7 @@ class EZMiceApp:
 
             with picamera.PiCamera() as camera:
                 self.camera = camera
-                camera.resolution = (1296, 972)
+                camera.resolution = (1920, 1080)
                 camera.exposure_mode = 'backlight' #auto
                 camera.awb_mode = 'auto'
                 camera.framerate = self.frame_rate
