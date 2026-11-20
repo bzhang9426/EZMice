@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Laptop-adapted version of ZeTV apparatus code. Supports short assays and
-long assays. Includes manual and automatic plate calibration modes, basic
-cv2 image processing, etc. Replaces serial commands with print lines and
-simulated LED/solenoid visualizer. Intended for use on Windows with native
-webcam.
+Laptop-adapted version of ZeTV apparatus code (mirrors the Pi "extended"
+build). Supports short assays and long assays. Includes manual and automatic
+plate calibration modes, basic cv2 image processing, etc. Replaces serial
+commands with print lines and simulated LED/solenoid visualizer. Intended for
+use on Windows with native webcam.
 """
-from asyncio import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 import threading
 import datetime
 import time
-import serial
 from subprocess import call
 import os
 import cv2
@@ -26,7 +24,9 @@ class EZMiceApp:
     B: Operator window for one chamber's recording, stimulus, and analysis on
        Windows/webcam. Holds the form fields, Extended/Manual flags, webcam
        settings, simulated Arduino thread, and plate geometry. Button callbacks
-       start work; simulated serial output and recording run on daemon threads.
+       start work; simulated serial output, recording, and calibration run on
+       daemon threads. Only one task uses the webcam at a time; self.busy is
+       True while recording or calibrating owns it.
     E: None from construction. See each method for the errors it reports.
     R: None. Keep the instance alive for as long as master.mainloop() runs.
     P: master (tk.Tk): The Tk root window this UI is gridded onto.
@@ -40,7 +40,9 @@ class EZMiceApp:
            Plate corners default to a rectangle inside a 1296x972 frame; the
            warp target is 600x400 with margins 48 and 34. Manual corners
            default to TL (150, 100), TR (1150, 100), BL (150, 800), BR
-           (1150, 800).
+           (1150, 800). signal_list starts empty and is filled from the Signal
+           Input field when a recording starts. processing_on is False, so
+           motion analysis is skipped unless it is set to True.
         E: None.
         R: None.
         P: master (tk.Tk): Tk root window.
@@ -50,6 +52,7 @@ class EZMiceApp:
         self.style = ttk.Style()
         self.style.theme_use('clam')
 
+        self.busy = False   # True while record/calibrate owns the webcam
         self.record_duration = tk.StringVar()
         self.chamber_number = tk.StringVar()
         self.animal_tag = tk.StringVar()
@@ -61,10 +64,16 @@ class EZMiceApp:
         self.scheduled_start = tk.StringVar()
         self.shutdown = 'c'
         self.signal_tracker = set()
+        self.signal_input = tk.StringVar()
+        self.signal_list = ""
+        self.signal_delay = 2
 
         self.plate_corners = np.float32([[100, 100], [1196, 100], [1196, 872], [100, 872]])
         self.target_width = 600
         self.target_height = 400
+
+        # Video processing toggle (no checkbox; set True to score motion).
+        self.processing_on = False
 
         self.manual_cal = tk.IntVar()
         self.coord_entries = []
@@ -90,10 +99,12 @@ class EZMiceApp:
         B: Lays out the form entries, Extended and Manual checkboxes, action
            buttons, and status line. Column 0 holds labels, column 1 holds
            entries, column 2 holds Extended, Select Folder, and capture
-           buttons, and column 3 holds Manual. The eight manual-corner entries
-           are created but hidden until toggle_coords() is triggered. Also
-           defines the BGR color map (self.stim_colors) for the live HUD
-           visualizer.
+           buttons, and column 3 holds Manual. Rows: duration, chamber, tag,
+           folder, stimulus set, signal input, scheduled start, then the
+           Record and Capture Image buttons, and the Calibrate button and
+           status line below them. The eight manual-corner entries are created
+           but hidden until toggle_coords() is triggered. Also defines the BGR
+           color map (self.stim_colors) for the live HUD visualizer.
         E: None.
         R: None. Widgets updated by later methods are stored as attributes on self.
         P: None. Uses self.master and the Tk variables initialized in __init__.
@@ -103,7 +114,8 @@ class EZMiceApp:
         ttk.Label(self.master, text='Animal Tag:').grid(row=2, column=0, sticky='w', padx=5, pady=2)
         ttk.Label(self.master, text='Folder Path:').grid(row=3, column=0, sticky='w', padx=5, pady=2)
         ttk.Label(self.master, text='Stimulus Set:').grid(row=4, column=0, sticky='w', padx=5, pady=2)
-        ttk.Label(self.master, text='Scheduled Start Time (HH.MM):').grid(row=5, column=0, sticky='w', padx=5, pady=2)
+        ttk.Label(self.master, text='Signal Input / Delay (s):').grid(row=5, column=0, sticky='w', padx=5, pady=2)
+        ttk.Label(self.master, text='Scheduled Start Time (HH.MM):').grid(row=6, column=0, sticky='w', padx=5, pady=2)
 
         ttk.Checkbutton(self.master, text="Extended", variable=self.extended_assay).grid(row=0, column=2, padx=5, pady=2)
 
@@ -120,17 +132,21 @@ class EZMiceApp:
         self.stim_set_entry = ttk.Entry(self.master, textvariable=self.stim_set)
         self.stim_set_entry.grid(row=4, column=1, columnspan=2, sticky='ew', padx=5, pady=2)
 
+        # Alternating signal list (e.g. "xw"). Empty means no alternation.
+        self.signal_entry = ttk.Entry(self.master, textvariable=self.signal_input)
+        self.signal_entry.grid(row=5, column=1, sticky='ew', padx=5, pady=2)
+        
         self.start_entry = ttk.Entry(self.master, textvariable=self.scheduled_start)
-        self.start_entry.grid(row=5, column=1, sticky='w', padx=5, pady=2)
+        self.start_entry.grid(row=6, column=1, sticky='w', padx=5, pady=2)
 
         self.record_button = ttk.Button(self.master, text='Record & Analyze', command=self.toggle_record)
-        self.record_button.grid(row=6, column=0, sticky='ew', padx=5, pady=5)
+        self.record_button.grid(row=7, column=0, sticky='ew', padx=5, pady=5)
 
-        ttk.Button(self.master, text='Capture Image', command=self.capture_and_display).grid(row=6, column=2, sticky='ew', padx=5, pady=5)
-        ttk.Button(self.master, text='Capture & Calibrate Plate', command=self.capture_and_calibrate).grid(row=7, column=2, sticky='ew', padx=5, pady=5)
+        ttk.Button(self.master, text='Capture Image', command=self.capture_and_display).grid(row=7, column=2, sticky='ew', padx=5, pady=5)
+        ttk.Button(self.master, text='Capture & Calibrate Plate', command=self.capture_and_calibrate).grid(row=8, column=2, sticky='ew', padx=5, pady=5)
 
         self.info_label = ttk.Label(self.master, text='')
-        self.info_label.grid(row=7, column=0, columnspan=2, padx=5, pady=5)
+        self.info_label.grid(row=8, column=0, columnspan=2, padx=5, pady=5)
 
         self.image_label = ttk.Label(self.master)
         self.image_label.grid(row=9, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
@@ -168,7 +184,7 @@ class EZMiceApp:
         """
         for i, entry in enumerate(self.coord_entries):
             if self.manual_cal.get():
-                entry.grid(row=int(i / 4 - 1 + 9), column=int(i % 4), padx=5, pady=2)
+                entry.grid(row=int(i / 4 - 1 + 10), column=int(i % 4), padx=5, pady=2)
             else:
                 entry.grid_remove()
 
@@ -248,9 +264,9 @@ class EZMiceApp:
            "time:chars" pairs; duplicate timestamps concatenate their character
            strings.
         E: ValueError or IndexError (from missing colons or non-numeric times)
-           is caught, displayed in a messagebox error dialog, and not
-           re-raised; returns whatever dictionary entries were parsed prior to
-           the error.
+           is caught, displayed in an error dialog (posted to the Tk thread),
+           and not re-raised; returns whatever dictionary entries were parsed
+           prior to the error.
         R: dict[float, str]: Mapping of timestamp keys to ASCII command
            character strings.
         P: None. Reads self.stim_set and self.extended_assay.
@@ -273,15 +289,15 @@ class EZMiceApp:
                     else {1: "w", 2: "wr", 3: "rg", 4: "gv", 5: "vs", 6: "sh", 7: "h"}
                 )
         except Exception as e:
-            messagebox.showerror("Error", f"Stimulus set input error: {e}")
+            self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Stimulus set input error: {m}"))
         return stim_dic
 
     def switch_signal(self, duration, last_time):
         """
-        B: Alternates active signals in self.signal_list (default "xw")
-           whenever `duration` seconds have elapsed since `last_time`. Prints
-           the ASCII-encoded signal toggled on and off to stdout, updates
-           self.signal_tracker, and rotates self.signal_list.
+        B: Alternates active signals in self.signal_list whenever `duration`
+           seconds have elapsed since `last_time`. Prints the ASCII-encoded
+           signal toggled on and off to stdout, updates self.signal_tracker,
+           and rotates self.signal_list.
         E: None.
         R: float: Updated perf_counter timestamp if the switch occurred,
            otherwise the unchanged `last_time`.
@@ -302,31 +318,37 @@ class EZMiceApp:
         """
         B: Simulates sending stimulus ASCII characters to an Arduino on a
            daemon thread while recording is active. Waits 2 seconds for
-           simulated board reset, polls at 0.05 s intervals, and matches either
-           clock time (HH.MM in Extended mode) or quantized elapsed seconds
-           (Short mode) against build_stim_dic(). Prints encoded ASCII bytes
-           to stdout and updates self.signal_tracker for the live HUD overlay.
-           Prints shutdown character ('c') once recording finishes.
+           simulated board reset, then clears self.signal_tracker and loads
+           self.signal_list from the Signal Input field (empty means no
+           alternation). Polls at 0.05 s intervals, and matches either clock
+           time (HH.MM in Extended mode) or quantized elapsed seconds (Short
+           mode) against build_stim_dic(). Prints each stimulus character and
+           its encoded ASCII byte to stdout and updates self.signal_tracker for
+           the live HUD overlay. Clears the tracker and prints the shutdown
+           character ('c') once recording finishes.
         E: Exceptions during initialization are caught and shown in an error
-           dialog (not re-raised). Unhandled errors inside the loop propagate
-           out of the daemon thread.
+           dialog (posted to the Tk thread, not re-raised). Unhandled errors
+           inside the loop propagate out of the daemon thread.
         R: None.
-        P: None. Reads self.recording, self.extended_assay, self.stim_set, and
-           self.shutdown.
+        P: None. Reads self.recording, self.extended_assay, self.stim_set,
+           self.signal_input, and self.shutdown.
         """
         try:
             time.sleep(2)
         except Exception as e:
-            messagebox.showerror("Error", f"Could not connect to Arduino: {e}")
+            self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Could not connect to Arduino: {m}"))
             return
 
+        self.signal_tracker.clear()
+        self.signal_list = self.signal_input.get().split(":")[0] if self.signal_input.get() else ""
+        self.signal_delay = float(self.signal_input.get().split(":")[1]) if self.signal_input.get() else 0
+        
         round_time = -1
         delay = 0.05
         arduino_start = time.perf_counter()
         stim_dic = self.build_stim_dic()
         last_time = time.perf_counter()
         recording_tracker = 0
-        self.signal_list = "xw"
 
         while recording_tracker < 2:
             if self.extended_assay.get():
@@ -338,7 +360,7 @@ class EZMiceApp:
                 round_time = current_round_time
                 if round_time in stim_dic:
                     for serial_char in stim_dic[round_time]:
-                        print(round_time)
+                        print(str(round_time) + " " + serial_char)
                         print(serial_char.encode('ascii'))
                         if serial_char in self.signal_tracker:
                             self.signal_tracker.remove(serial_char)
@@ -346,7 +368,7 @@ class EZMiceApp:
                             self.signal_tracker.add(serial_char)
 
             if len(set(self.signal_list) & self.signal_tracker) == 1:
-                last_time = self.switch_signal(2, last_time)
+                last_time = self.switch_signal(self.signal_delay, last_time)
             else:
                 for off_char in self.signal_list:
                     if off_char in self.signal_tracker:
@@ -361,6 +383,7 @@ class EZMiceApp:
             time.sleep(delay)
 
         recording_tracker = 0
+        self.signal_tracker.clear()
         print(self.shutdown.encode('ascii'))
 
     def run_arduino(self):
@@ -368,8 +391,8 @@ class EZMiceApp:
         B: Spawns and starts self.send_serial on a daemon thread so simulated
            serial timing runs concurrently with video capture and terminates if
            the main window closes.
-        E: Exception if thread creation/start fails is caught, shown in a
-           messagebox error dialog, and not re-raised.
+        E: Exception if thread creation/start fails is caught, shown in an
+           error dialog (posted to the Tk thread), and not re-raised.
         R: None.
         P: None.
         """
@@ -377,7 +400,7 @@ class EZMiceApp:
             self.arduino_thread = threading.Thread(target=self.send_serial, daemon=True)
             self.arduino_thread.start()
         except Exception as e:
-            messagebox.showerror("Error", f"Could not start Arduino thread: {e}")
+            self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Could not start Arduino thread: {m}"))
 
     def select_folder(self):
         """
@@ -408,16 +431,22 @@ class EZMiceApp:
     def toggle_record(self):
         """
         B: Starts a new recording session or signals an active one to stop.
-           Validates that a save folder is selected and duration is a valid
-           integer before setting self.recording = True, starting
-           record_with_preview on a daemon thread, and relabeling the button to
-           "Stop". Clicking while recording sets self.recording = False.
-        E: Missing folder or ValueError from non-integer duration is caught,
-           displayed in a messagebox error dialog, and not re-raised.
+           Validates that the webcam is free, a save folder is selected, and
+           duration is a valid integer before setting self.recording = True,
+           starting record_with_preview on a daemon thread, and relabeling the
+           button to "Stop". Clicking while recording sets self.recording =
+           False.
+        E: A busy webcam, missing folder, or ValueError from a non-integer
+           duration is caught, displayed in an error dialog, and not
+           re-raised.
         R: None.
-        P: None. Reads self.recording, self.save_path, and self.record_duration.
+        P: None. Reads self.recording, self.busy, self.save_path, and
+           self.record_duration.
         """
         if not self.recording:
+            if self.busy:
+                messagebox.showerror("Error", "The camera is busy with another task.")
+                return
             if not self.save_path.get():
                 messagebox.showerror("Error", "Please select a folder path first.")
                 return
@@ -435,36 +464,52 @@ class EZMiceApp:
 
     def record_with_preview(self):
         """
-        B: Captures video from the default webcam (index 0) at 2 fps (Extended)
-           or 30 fps (Short) and writes directly to an MP4 file (1296x972).
-           Starts the simulated Arduino thread, optionally waits in a live
-           preview loop until Scheduled Start Time (HH.MM), records for the
-           requested duration while displaying a live OpenCV preview window
-           with the HUD status overlay, releases resources, and triggers
-           process_video().
-        E: OpenCV, filesystem, or invalid float(scheduled_start) ValueError
-           exceptions are not caught here and propagate out of the daemon
-           thread (cleanup runs in finally).
-        R: None. Writes "<stem>.mp4" and triggers "<stem>_motion_indices.csv"
-           and "<stem>.avi".
+        B: Captures video from the default webcam (index 0) at 1920x1080 and
+           writes it to an MP4 file at 2 fps (Extended) or 30 fps (Short);
+           frames the webcam returns at another size are resized. Starts the
+           simulated Arduino thread, optionally waits in a live preview loop
+           until Scheduled Start Time (HH.MM, compared rounded to 2 places),
+           records for the requested duration (timed from the scheduled
+           start) while displaying a live OpenCV preview window with the HUD
+           status overlay, then releases the webcam and clears self.busy.
+           Clearing self.recording also ends send_serial. process_video()
+           runs afterwards only if self.processing_on is True. Widget updates
+           are posted to the Tk thread with master.after.
+        E: Failures are caught and shown in an error dialog; the webcam, busy
+           flag, recording flag, and button are always reset.
+        R: None. Writes "<stem>.mp4"; with processing on, also
+           "<stem>_motion_indices.csv" and "<stem>.avi".
         P: None. Reads self.save_path, self.extended_assay,
-           self.scheduled_start, and self.record_duration.
+           self.scheduled_start, self.record_duration, and self.processing_on.
         """
         save_dir = self.save_path.get()
         fileType = ".mp4"
         self.frame_rate = 2 if self.extended_assay.get() else 30
-
-        cap = cv2.VideoCapture(0)
-        cv2.namedWindow("Camera Preview", cv2.WINDOW_NORMAL)
+        rec_w, rec_h = 1920, 1080
+        self.busy = True
+        filename = None
+        mp4_path = None
+        completed = False
+        cap = None
+        out = None
 
         try:
+            scheduled = self.scheduled_start.get()
+            scheduled_val = float(scheduled) if scheduled != "" else None
+            duration = int(self.record_duration.get())
+
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, rec_w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rec_h)
+            cv2.namedWindow("Camera Preview", cv2.WINDOW_NORMAL)
+
             self.run_arduino()
             time.sleep(2)
 
-            while self.recording and self.scheduled_start.get() != "":
+            while self.recording and scheduled_val is not None:
                 now = datetime.datetime.now()
-                current_hhmm = now.hour + (now.minute / 100.0)
-                if current_hhmm == float(self.scheduled_start.get()):
+                current_hhmm = round(now.hour + (now.minute / 100.0), 2)
+                if current_hhmm == scheduled_val:
                     break
                 ret, frame = cap.read()
                 if ret:
@@ -476,17 +521,18 @@ class EZMiceApp:
             mp4_path = f"{filename}{fileType}"
 
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(mp4_path, fourcc, self.frame_rate, (1296, 972))
+            out = cv2.VideoWriter(mp4_path, fourcc, self.frame_rate, (rec_w, rec_h))
 
             self.master.after(0, lambda: self.info_label.config(text=f"Recording to {filename}"))
 
             start_time = time.monotonic()
-            duration = int(self.record_duration.get())
-
             while self.recording and (time.monotonic() - start_time < duration):
                 ret, frame = cap.read()
                 if not ret:
                     break
+
+                if frame.shape[1] != rec_w or frame.shape[0] != rec_h:
+                    frame = cv2.resize(frame, (rec_w, rec_h))
 
                 display_frame = self.draw_status_overlay(frame.copy())
                 out.write(frame)
@@ -494,21 +540,30 @@ class EZMiceApp:
                 cv2.imshow("Camera Preview", display_frame)
                 cv2.waitKey(1)
 
-            out.release()
+            completed = self.recording          # False if Stop was pressed
+            # Clearing this also ends send_serial.
+            self.recording = False
 
-            if self.recording:
-                self.master.after(0, lambda: self.info_label.config(text=f"Video saved to {filename}"))
-            else:
-                self.master.after(0, lambda: self.info_label.config(text="Recording stopped."))
-
+        except Exception as e:
+            self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Recording failed: {m}"))
         finally:
             self.recording = False
-            cap.release()
+            if out is not None:
+                out.release()
+            if cap is not None:
+                cap.release()
             cv2.destroyAllWindows()
+            self.busy = False
             self.master.after(0, lambda: self.record_button.config(text='Record & Analyze'))
 
-            if os.path.exists(mp4_path):
-                self.process_video(mp4_path, f"{filename}_motion_indices.csv")
+        if mp4_path is None:
+            return
+
+        msg = f"Video saved to {filename}" if completed else "Recording stopped."
+        self.master.after(0, lambda: self.info_label.config(text=msg))
+
+        if os.path.exists(mp4_path) and self.processing_on:
+            self.process_video(mp4_path, f"{filename}_motion_indices.csv")
 
     def find_plate_corners(self, img):
         """
@@ -598,7 +653,8 @@ class EZMiceApp:
            A-H, cols 1-12) and writes both a CSV table and a binary motion-mask
            AVI video. Warps each grayscale frame, computes absolute pixel
            difference against the previous frame, thresholds at 25, and counts
-           nonzero pixels inside each inset well bounding box.
+           nonzero pixels inside each inset well bounding box. Only called when
+           self.processing_on is True.
         E: Unreadable video stream or empty first frame prints an error /
            releases capture and returns early without raising. File I/O or
            VideoWriter errors propagate.
@@ -675,16 +731,21 @@ class EZMiceApp:
 
     def capture_and_display(self):
         """
-        B: Captures a single 1296x972 frame from the webcam, flushes 5 frames
-           for auto-exposure settling, crops and upscales the central plate ROI
-           to replicate PiCamera zoom, draws a 50-pixel coordinate grid if
-           Manual mode is enabled, saves 'image.jpg' to self.save_path, and
-           displays a 640x400 preview in a Toplevel popup window.
-        E: RuntimeError (failed frame grab), OpenCV, PIL, or filesystem errors
-           are caught, shown in a messagebox error dialog, and not re-raised.
+        B: Captures a single frame from the webcam at 1296x972, flushing 5
+           frames for auto-exposure settling, resizes it to 1296x972 if the
+           webcam returned another size (no zoom crop), draws a 50-pixel
+           coordinate grid if Manual mode is enabled, saves 'image.jpg' to
+           self.save_path, and displays a 640x400 preview in a Toplevel popup
+           window. Runs on the Tk thread.
+        E: A busy webcam, RuntimeError (failed frame grab), OpenCV, PIL, or
+           filesystem errors are caught, shown in an error dialog, and not
+           re-raised.
         R: None. Writes "<save_path>/image.jpg".
-        P: None. Reads self.save_path and self.manual_cal.
+        P: None. Reads self.busy, self.save_path, and self.manual_cal.
         """
+        if self.busy:
+            messagebox.showerror("Error", "The camera is busy with another task.")
+            return
         try:
             image_path = os.path.join(self.save_path.get(), 'image.jpg')
             width, height = 1296, 972
@@ -701,11 +762,7 @@ class EZMiceApp:
             finally:
                 cap.release()
 
-            x, y = int(0.39 * width), int(0.3 * height)
-            zw, zh = int(0.25 * width), int(0.25 * height)
-            cropped = frame[y:y + zh, x:x + zw]
-
-            grid_img = cv2.resize(cropped, (width, height), interpolation=cv2.INTER_LINEAR)
+            grid_img = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
 
             if self.manual_cal.get():
                 step_size = 50
@@ -736,49 +793,75 @@ class EZMiceApp:
 
     def capture_and_calibrate(self):
         """
-        B: Opens a live webcam preview window until the user presses SPACE or
-           ENTER to grab a calibration frame. Runs find_plate_corners() and
-           apply_warp(), overlays the 8x12 well grid (orange outer borders,
-           green inner dividers), displays a 640x400 Tk Toplevel preview, and
-           deletes the temporary JPEG files afterward.
-        E: Capture, image load, or display errors are caught, shown in a
-           messagebox error dialog, and not re-raised.
+        B: Button callback. Checks that the webcam is free and a folder is
+           chosen, then starts calibrate_plate on a daemon thread, the same
+           way toggle_record starts record_with_preview. The Tk thread is
+           never blocked.
+        E: A busy webcam or a missing folder is shown in an error dialog and
+           nothing is started.
+        R: None.
+        P: None. Reads self.busy and self.save_path.
+        """
+        if self.busy:
+            messagebox.showerror("Error", "The camera is busy with another task.")
+            return
+        if not self.save_path.get():
+            messagebox.showerror("Error", "Please select a folder path first.")
+            return
+        self.calibrate_thread = threading.Thread(target=self.calibrate_plate, daemon=True)
+        self.calibrate_thread.start()
+
+    def calibrate_plate(self):
+        """
+        B: Opens a live 1920x1080 webcam preview window until the user presses
+           SPACE or ENTER to grab a calibration frame. Runs
+           find_plate_corners() and apply_warp(), overlays the 8x12 well grid
+           (orange outer borders, green inner dividers), deletes the temporary
+           JPEG files, and shows a 640x400 Toplevel preview. The popup and
+           status text are created on the Tk thread via master.after. Runs on
+           a daemon thread.
+        E: Capture, image load, or display errors are caught, shown in an
+           error dialog (posted to the Tk thread), and not re-raised. The
+           webcam and busy flag are always reset.
         R: None. Updates self.plate_corners on success.
         P: None. Reads self.save_path and plate geometry attributes.
         """
+        image_path = os.path.join(self.save_path.get(), 'calibration_capture.jpg')
+        preview_path = os.path.join(self.save_path.get(), 'calibrated_plate_preview.jpg')
+        window_name = "Calibration Preview - Press SPACE or ENTER to capture"
+        self.busy = True
         try:
-            image_path = os.path.join(self.save_path.get(), 'calibration_capture.jpg')
-            preview_path = os.path.join(self.save_path.get(), 'calibrated_plate_preview.jpg')
-
             cap = cv2.VideoCapture(0)
+            frame = None
             try:
-                cv2.namedWindow("Calibration Preview - Press SPACE or ENTER to capture", cv2.WINDOW_NORMAL)
-                frame = None
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
                 while True:
                     ret, current_frame = cap.read()
                     if ret:
                         frame = current_frame
-                        cv2.imshow("Calibration Preview - Press SPACE or ENTER to capture", frame)
+                        cv2.imshow(window_name, frame)
 
                     key = cv2.waitKey(1) & 0xFF
                     if key in (13, 32):
                         break
-
-                cv2.destroyAllWindows()
-
-                if frame is None:
-                    messagebox.showerror("Error", "Failed to capture calibration image.")
-                    return
-
-                cv2.imwrite(image_path, frame)
             finally:
                 cap.release()
                 cv2.destroyAllWindows()
 
+            if frame is None:
+                self.master.after(0, lambda: messagebox.showerror("Error", "Failed to capture calibration image."))
+                return
+
+            if frame.shape[1] != 1920 or frame.shape[0] != 1080:
+                frame = cv2.resize(frame, (1920, 1080))
+            cv2.imwrite(image_path, frame)
+
             img = cv2.imread(image_path)
             if img is None:
-                messagebox.showerror("Error", "Failed to load calibration image.")
+                self.master.after(0, lambda: messagebox.showerror("Error", "Failed to load calibration image."))
                 return
 
             gray = self.find_plate_corners(img)
@@ -794,27 +877,29 @@ class EZMiceApp:
                 cv2.line(warped, (x, 0), (x, self.target_height), (0, 150, 255 if c % 12 == 0 else 0), 2)
 
             cv2.imwrite(preview_path, warped)
-
             pil_img = Image.open(preview_path).resize((640, 400), Image.LANCZOS)
 
-            popup = tk.Toplevel(self.master)
-            popup.title("Plate Calibration Preview")
-
-            tk_img = ImageTk.PhotoImage(pil_img)
-            popup_label = ttk.Label(popup, image=tk_img)
-            popup_label.image = tk_img
-            popup_label.pack(padx=10, pady=10)
-
-            time.sleep(1)
             for path in (image_path, preview_path):
                 if os.path.exists(path):
                     os.remove(path)
                 else:
                     print(f"Failed to delete {path}")
 
-            self.info_label.config(text="Calibration preview generated with grid overlay.")
+            # Widgets must be created on the Tk thread.
+            def show_popup():
+                popup = tk.Toplevel(self.master)
+                popup.title("Plate Calibration Preview")
+                tk_img = ImageTk.PhotoImage(pil_img)
+                popup_label = ttk.Label(popup, image=tk_img)
+                popup_label.image = tk_img
+                popup_label.pack(padx=10, pady=10)
+                self.info_label.config(text="Calibration preview generated with grid overlay.")
+            self.master.after(0, show_popup)
+
         except Exception as e:
-            messagebox.showerror("Error", f"Calibration capture failed: {e}")
+            self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Calibration capture failed: {m}"))
+        finally:
+            self.busy = False
 
 
 def main():

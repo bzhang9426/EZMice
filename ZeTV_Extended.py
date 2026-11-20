@@ -83,6 +83,7 @@ class EZMiceApp:
         self.signal_tracker = set()
         self.signal_input = tk.StringVar()
         self.signal_list = ""
+        self.signal_delay = 2
 
         # Source-image corners (TL, TR, BR, BL) and the rectangle they warp into.
         self.plate_corners = np.float32([[100, 100], [1196, 100], [1196, 872], [100, 872]])
@@ -326,7 +327,9 @@ class EZMiceApp:
             self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Could not connect to Arduino: {m}"))
             return
         
-        self.signal_list = self.signal_input.get() if self.signal_input.get() else ""
+        self.signal_list = self.signal_input.get().split(":")[0] if self.signal_input.get() else ""
+        self.signal_delay = float(self.signal_input.get().split(":")[1]) if self.signal_input.get() else 0
+        
         round_time = -1
         arduino_start = time.perf_counter()
         delay = 0.05
@@ -351,7 +354,7 @@ class EZMiceApp:
                         else:
                             self.signal_tracker.add(serial_char)
             if len(set(self.signal_list) & self.signal_tracker) == 1:
-                last_time = self.switch_signal(arduino, 2, last_time)
+                last_time = self.switch_signal(arduino, self.signal_delay, last_time)
             else:
                 for off_char in self.signal_list:
                     if off_char in self.signal_tracker:
