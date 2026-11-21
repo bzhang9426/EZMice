@@ -153,7 +153,7 @@ class EZMiceApp:
         self.stim_set_entry.grid(row=4, column=1, columnspan=2, sticky='ew', padx=5, pady=2)
 
         # Signal list entry for the Arduino. Free text, parsed by send_serial.
-        self.signal_input = ttk.Entry(self.master, textvariable=self.stim_set)
+        self.signal_input = ttk.Entry(self.master, textvariable=self.signal_input)
         self.signal_input.grid(row=5, column=1, sticky='ew', padx=5, pady=2)
 
         # Seconds between serial time checks. Empty means 0.05 in send_serial.
@@ -184,7 +184,7 @@ class EZMiceApp:
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_y))
 
         # Preview toggle
-        ttk.Checkbutton(self.master, text="Preview", variable=self.preview_open, command=self.toggle_preview).grid(row=6, column=1, padx=5, pady=2)
+        ttk.Checkbutton(self.master, text="Preview", variable=self.preview_open, command=self.toggle_preview).grid(row=7, column=1, padx=5, pady=2)
         # Video processing toggle
     def toggle_coords(self):
         """
@@ -216,7 +216,8 @@ class EZMiceApp:
             if self.preview_open.get():              # box was just ticked
                 if self.camera is None:
                     self.camera = picamera.PiCamera()
-                self.camera.start_preview()
+                self.camera.start_preview(fullscreen=False, window=(400,0,400,400))
+
             elif self.camera is not None:            # box was just unticked
                 self.camera.stop_preview()
                 if not self.busy:                    # standalone preview: free the camera
@@ -326,10 +327,9 @@ class EZMiceApp:
         except Exception as e:
             self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Could not connect to Arduino: {m}"))
             return
-        
+
         self.signal_list = self.signal_input.get().split(":")[0] if self.signal_input.get() else ""
         self.signal_delay = float(self.signal_input.get().split(":")[1]) if self.signal_input.get() else 0
-        
         round_time = -1
         arduino_start = time.perf_counter()
         delay = 0.05
@@ -493,7 +493,8 @@ class EZMiceApp:
                 self.run_arduino()
                 time.sleep(2)
 
-                camera.start_preview()
+                camera.start_preview(fullscreen=False, window=(400,0,400,400))
+
                 self.preview_open.set(1)
 
                 while (self.recording and self.scheduled_start.get() != "" and
@@ -839,7 +840,8 @@ class EZMiceApp:
                 print(self.awbgains)
                 print(self.shutter)
 
-                camera.start_preview()
+                camera.start_preview(fullscreen=False, window=(400,0,400,400))
+
                 self.preview_open.set(1)
                 while self.preview_open.get():       # untick Preview to take the shot
                     time.sleep(0.1)
