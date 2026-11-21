@@ -221,8 +221,8 @@ class EZMiceApp:
                 if self.camera is None:
                     self.camera = Picamera2()
                     self.camera.configure(self.camera.create_preview_configuration(main={"size": (1456, 1088)}))
-                # Use Preview.QT instead of QTGL if the desktop has no GL (e.g. VNC).
-                self.camera.start_preview(Preview.QTGL, x=400, y=0, width=400, height=400)
+                # Use Preview.QT instead of QT if the desktop has no GL (e.g. VNC).
+                self.camera.start_preview(Preview.QT, x=400, y=0, width=400, height=400)
                 if not self.camera.started:
                     self.camera.start()
 
@@ -508,7 +508,7 @@ class EZMiceApp:
                 self.run_arduino()
                 time.sleep(2)
 
-                camera.start_preview(Preview.QTGL, x=400, y=0, width=400, height=400)
+                camera.start_preview(Preview.QT, x=400, y=0, width=400, height=400)
 
                 self.preview_open.set(1)
 
@@ -847,7 +847,7 @@ class EZMiceApp:
                     main={"size": (1456, 1088)},
                     controls={"FrameDurationLimits": (1000000 // self.frame_rate,) * 2}))
                 #camera.zoom = (0.39, 0.3, 0.25, 0.25)
-                camera.start_preview(Preview.QTGL, x=400, y=0, width=400, height=400)
+                camera.start_preview(Preview.QT, x=400, y=0, width=400, height=400)
                 self.preview_open.set(1)
                 camera.start()
                 # Let auto AWB and auto shutter settle, then pin both.
