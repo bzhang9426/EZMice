@@ -5,9 +5,9 @@ EZMice v0.4.1 — well-plate recording and per-well motion scoring.
 B: Records a plate assay, pulses an Arduino from a stimulus schedule, and
    writes a motion index for each of the 96 wells. Short assays run at 30 fps;
    Extended assays run at 2 fps and key the Arduino off the clock minute.
-   Picamera2 records H264, ffmpeg remuxes it at that frame rate, and OpenCV
-   warps the plate before frame-subtraction. Calibration can lock white
-   balance and shutter speed, or the operator can type the four corners.
+   Picamera2 (monochrome IMX296) records H264, ffmpeg remuxes it at that frame
+   rate, and OpenCV warps the plate before frame-subtraction. Calibration can
+   lock the shutter speed, or the operator can type the four corners.
 E: None at import. Each method reports its own failures.
 R: None. Runs until the window is closed.
 P: None. Start with `python3 ezmice.py`.
@@ -35,11 +35,10 @@ class EZMiceApp:
     """
     B: Operator window for one chamber's recording, stimulus, and analysis.
        Holds the form fields, Extended/Manual flags, Pi camera settings
-       (white balance, shutter, frame rate), the Arduino thread, and the
-       plate geometry. Only one Picamera2 exists at a
-       time; self.busy is True while recording or calibrating owns it.
-       Button callbacks start work; serial output, recording,
-       and calibration run on daemon threads.
+       (shutter, frame rate), the Arduino thread, and the plate geometry.
+       Only one Picamera2 exists at a time; self.busy is True while
+       recording or calibrating owns it. Button callbacks start work; serial
+       output, recording, and calibration run on daemon threads.
     E: None from construction. See each method for the errors it reports.
     R: None. Keep the instance alive for as long as master.mainloop() runs.
     P: master — the Tk root this UI is gridded onto.
@@ -55,8 +54,8 @@ class EZMiceApp:
            run Capture & Calibrate Plate (or type the corners) before the
            first recording. The warp target is 600x400 with margins 48 and 34.
            Manual corners default to TL (150, 100), TR (1150, 100),
-           BL (150, 800), BR (1150, 800). awbgains and shutter are replaced
-           when Capture & Calibrate samples the camera.
+           BL (150, 800), BR (1150, 800). The shutter is replaced when
+           Capture & Calibrate samples the camera.
         E: None.
         R: None.
         P: master — Tk root window.
@@ -94,7 +93,7 @@ class EZMiceApp:
         self.target_height = 400
 
         # Video processing toggle:
-        self.processing_on = False
+        self.processing_on = True
 
         # Manual corner entries. Hidden until the Manual checkbox is on.
         self.manual_cal = tk.IntVar()
@@ -112,8 +111,6 @@ class EZMiceApp:
         self.pmarg_x = 48
         self.pmarg_y = 34
 
-        # Red and blue gains. Calibration overwrites this after sampling auto AWB.
-        self.awbgains = (1.0, 2.3)
         # Placeholder until record_with_preview reads the Extended checkbox.
         self.frame_rate = 2 if self.extended_assay.get() else 30
         # Microseconds. Calibration overwrites this from the camera's auto shutter.
@@ -221,8 +218,8 @@ class EZMiceApp:
                 if self.camera is None:
                     self.camera = Picamera2()
                     self.camera.configure(self.camera.create_preview_configuration(main={"size": (1456, 1088)}))
-                # Use Preview.QT instead of QT if the desktop has no GL (e.g. VNC).
-                self.camera.start_preview(Preview.QT, x=400, y=0, width=400, height=400)
+                # Preview.QT draws in software. QTGL and DRM both failed on this rotated display.
+                self.camera.start_preview(Preview.QT)
                 if not self.camera.started:
                     self.camera.start()
 
@@ -417,7 +414,7 @@ class EZMiceApp:
         P: None. Reads self.chamber_number and self.animal_tag.
         """
         now = datetime.datetime.now()
-        return f"/Chamber{self.chamber_number.get()}_Tag{self.animal_tag.get()}_{now.strftime('%Y-%m-%d_%H:%M:%S')}"
+        return f"/Chamber{self.chamber_number.get()}_Tag{self.animal_tag.get()}_{now.strftime('%Y-%m-%d_%H-%M-%S')}"
 
     def toggle_record(self):
         """
@@ -458,23 +455,23 @@ class EZMiceApp:
         B: Records H264 for the requested duration, remuxes to MP4, then scores
            motion. Extended sets the camera and the ffmpeg rate to 2 fps;
            otherwise both are 30. A standalone preview camera is closed first.
-           The video configuration is 1456x1088 with auto exposure and auto
-           white balance off, gains from self.awbgains, the exposure time from
-           self.shutter, analogue gain 1.0, and the frame duration pinned to
-           the frame rate. The Arduino thread starts with the recording.
-           The preview window opens first (the camera itself starts when
-           recording begins). The loop sleeps 0.1 s at a time until Stop is
-           pressed or the duration elapses (timed from the scheduled start,
-           if one is set). The camera is closed before ffmpeg stream-copies
-           the H264 into an MP4 stamped at self.frame_rate. process_video
-           runs only when that MP4 exists. Widget updates are posted to the
-           Tk thread with master.after. Clearing self.recording also ends
-           send_serial before the remux. self.busy is True while the camera
-           is held.
+           The video configuration is 1456x1088 with auto exposure off, the
+           exposure time from self.shutter, analogue gain 1.0, and the frame
+           duration pinned to the frame rate. The sensor is monochrome, so
+           there is no white balance to set. The Arduino thread starts with
+           the recording. The preview window opens first (the camera itself
+           starts when recording begins). The loop sleeps 0.1 s at a time
+           until Stop is pressed or the duration elapses (timed from the
+           scheduled start, if one is set). The camera is closed before ffmpeg
+           stream-copies the H264 into an MP4 stamped at self.frame_rate.
+           process_video runs only when that MP4 exists. Widget updates are
+           posted to the Tk thread with master.after. Clearing self.recording
+           also ends send_serial before the remux. self.busy is True while the
+           camera is held.
         E: Failures are caught and shown in an error dialog; the camera, busy
            flag, recording flag, and button are always reset.
         R: None. Writes "<stem>.h264", "<stem>.mp4", and the analysis outputs.
-        P: None. Reads the form fields, self.extended_assay, self.awbgains, and self.shutter.
+        P: None. Reads the form fields, self.extended_assay, and self.shutter.
         """
         save_dir = self.save_path.get()
         filename = save_dir + self.get_filename()
@@ -495,20 +492,20 @@ class EZMiceApp:
                 # Controls in the configuration are applied when the camera starts.
                 camera.configure(camera.create_video_configuration(
                     main={"size": (1456, 1088)},
+                    lores={"size": (320, 240)},
+                    display="lores",
                     controls={
                         "FrameDurationLimits": (1000000 // self.frame_rate,) * 2,
                         "AeEnable": False,
-                        "AwbEnable": False,
-                        "ColourGains": tuple(self.awbgains),
                         "ExposureTime": int(self.shutter),
                         "AnalogueGain": 1.0,
                     }))
                 #camera.zoom = (0.39, 0.3, 0.25, 0.25)
 
                 self.run_arduino()
-                time.sleep(2)
+                #time.sleep(2)
 
-                camera.start_preview(Preview.QT, x=400, y=0, width=400, height=400)
+                camera.start_preview(Preview.QT)
 
                 self.preview_open.set(1)
 
@@ -526,7 +523,8 @@ class EZMiceApp:
                     time.sleep(0.1)
 
                 camera.stop_recording()
-                camera.stop_preview()
+                if self.preview_open.get():
+                    camera.stop_preview()
                 self.preview_open.set(0)
 
                 completed = self.recording          # False if Stop was pressed
@@ -540,8 +538,8 @@ class EZMiceApp:
             self.master.after(0, lambda: self.info_label.config(text=msg))
 
             # Stream copy. -framerate stamps the raw H264, which has no timestamps.
-            #command = "MP4Box -add {0}.h264 {1}.mp4".format(filename, filename)
-            command = f"ffmpeg -y -framerate {self.frame_rate} -i {filename}.h264 -c copy {filename}.mp4"
+            #command = f"ffmpeg -y -framerate {self.frame_rate} -i {filename}.h264 -c copy {filename}.mp4"
+            command = f'MP4Box -fps {self.frame_rate} -add "{filename}.h264" -new "{filename}.mp4"'
             call([command], shell=True)
 
             if os.path.exists(filename + fileType) and self.processing_on:
@@ -555,32 +553,35 @@ class EZMiceApp:
             self.recording = False
             self.master.after(0, lambda: self.record_button.config(text='Record & Analyze'))
 
-    def find_plate_corners(self, img):
+    def find_plate_corners(self, gray):
         """
-        B: Sets self.plate_corners and returns img with any detection overlay.
+        B: Sets self.plate_corners and returns a BGR copy of the frame with any
+           detection overlay. The frame is already single-channel (the sensor
+           is monochrome), so there is no colour conversion on the way in.
            Manual mode copies TL, TR, BR, BL from the eight entries and does
-           no detection. Otherwise the grayscale frame is blurred and
-           contrast-stretched. Canny runs at 1/12 and 1/5 of that image's Otsu
-           value. Those contours are painted back on, 20 px thick, and a 7x7
-           close joins gaps. A second Canny (20, 50) produces the contours
-           that are scored. Largest first: the convex hull is drawn red, its
-           polygon green, and every contour blue. The first polygon with 4
-           vertices is ordered and saved. If none qualifies, the existing
-           corners are left in place.
-        E: OpenCV raises if img is not a BGR image on the automatic path.
-           A missed plate is not an exception; the method prints
-           "Failed to find corners" and returns img. Manual mode does not
-           validate that the entries form a usable quad.
-        R: img. Automatic mode draws the overlay on it; manual mode returns it unchanged.
-        P: img — BGR frame. Modified in place on the automatic path.
+           no detection. Otherwise the frame is blurred and contrast-stretched.
+           Canny runs at 1/14 and 1/5.5 of that image's Otsu value. Those
+           contours are painted back on, 20 px thick, and a 7x7 close joins
+           gaps. A second Canny (20, 50) produces the contours that are
+           scored. Largest first: the convex hull is drawn red, its polygon
+           green, and every contour blue, on the BGR copy. The first polygon
+           with 4 vertices is ordered and saved. If none qualifies, the
+           existing corners are left in place.
+        E: cv2.error if gray is not a single-channel 8-bit image on the
+           automatic path. A missed plate is not an exception; the method
+           prints "Failed to find corners" and returns the overlay copy.
+           Manual mode does not validate that the entries form a usable quad.
+        R: BGR image the same size as gray. Automatic mode has the overlay
+           drawn on it; manual mode returns the plain frame.
+        P: gray — single-channel uint8 frame. Not modified.
         """
+        overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         if self.manual_cal.get():
             self.plate_corners = np.float32([[self.tl_x.get(), self.tl_y.get()], [self.tr_x.get(), self.tr_y.get()], [self.br_x.get(), self.br_y.get()], [self.bl_x.get(), self.bl_y.get()]])
-            return img
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (15,15), 0) ###gray
+            return overlay
+        blurred = cv2.GaussianBlur(gray, (15,15), 0)
         # alpha > 1 stretches contrast so the plate rim separates from the bench.
-        blurred = cv2.convertScaleAbs(blurred, alpha=1.5, beta=0) #blurred
+        blurred = cv2.convertScaleAbs(blurred, alpha=1.5, beta=0)
 
         # Otsu supplies the Canny thresholds; the binary image itself is discarded.
         otsu_thresh, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -588,7 +589,7 @@ class EZMiceApp:
 
         contours1, _ = cv2.findContours(edged1.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         # Thick white redraw turns a broken rim into a solid band for the close.
-        cv2.drawContours(edged1, contours1, -1, (255, 255, 255), 20)
+        cv2.drawContours(edged1, contours1, -1, 255, 20)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7,7))
         closed_mask = cv2.morphologyEx(edged1, cv2.MORPH_CLOSE, kernel)
@@ -596,16 +597,14 @@ class EZMiceApp:
         edged2 = cv2.Canny(closed_mask, 20, 50)
         contours2, _ = cv2.findContours(edged2.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = sorted(contours2, key=cv2.contourArea, reverse=True)
-        i = 0
         for c in contours:
             convex = cv2.convexHull(c)
-            area = cv2.contourArea(c)
             peri = cv2.arcLength(c, True)
             # 2% of the perimeter: tight enough to keep corners, loose enough for a rim.
             approx = cv2.approxPolyDP(convex, 0.02*peri, True)
-            cv2.drawContours(img, [convex], -1, (0, 0, 255), 4)
-            cv2.drawContours(img, [approx], -1, (0, 255, 0), 4)
-            cv2.drawContours(img, contours, -1, (255, 0, 0), 4)
+            cv2.drawContours(overlay, [convex], -1, (0, 0, 255), 4)
+            cv2.drawContours(overlay, [approx], -1, (0, 255, 0), 4)
+            cv2.drawContours(overlay, contours, -1, (255, 0, 0), 4)
 
             if len(approx) == 4:
                 # (4, 1, 2) from approxPolyDP -> (4, 2) for getPerspectiveTransform.
@@ -613,11 +612,11 @@ class EZMiceApp:
                 print("Successfully found plate corners.")
                 self.plate_corners = self.order_points(pts)
                 print(self.plate_corners)
-                return img
+                return overlay
 
         # Detection missed. Callers keep using the corners already on self.
         print("Failed to find corners")
-        return img
+        return overlay
 
     def order_points(self, pts):
         """
@@ -648,14 +647,17 @@ class EZMiceApp:
         """
         B: Scores motion in each well and writes a CSV plus a mask video.
            The first decoded frame is the subtraction reference and is not a
-           CSV row. Each later frame is warped, subtracted, and thresholded
-           at 25. A well's motion index is the count of white pixels in its
-           box. Wells are inset by pmarg_x and pmarg_y; the step is
+           CSV row. OpenCV decodes the MP4 as three identical channels (the
+           sensor is monochrome), so each frame is reduced to one channel
+           once and everything after that is single-channel. Each later frame
+           is warped, subtracted, and thresholded at 25. A well's motion index
+           is the count of white pixels in its box (cv2.countNonZero). Wells
+           are inset by pmarg_x and pmarg_y; the step is
            (target - 2*margin) / 8 rows and / 12 columns. Time (s) is
            frame_idx / self.frame_rate, not the file's reported fps and not
            the wall-clock duration. The header is Frame, Time (s), then
-           A1..H12. The mask video is XVID at self.frame_rate and is named
-           "<video>_analysis.avi".
+           A1..H12. The mask video is XVID, single-channel, at
+           self.frame_rate and is named "<video>_analysis.avi".
         E: A video that cannot be opened prints a message and returns. A file
            with no first frame returns after the capture is released. Neither
            case raises. CSV or VideoWriter failures propagate.
@@ -674,7 +676,6 @@ class EZMiceApp:
             return
 
         prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-        #prev_gray = self.find_plate_corners(prev_frame)
         prev_warp = self.apply_warp(prev_gray)
 
         # 8 rows (A-H) by 12 columns, inset by the margins. The outer edge of
@@ -698,10 +699,11 @@ class EZMiceApp:
                 header.append(f"{chr(65+r)}{c+1}")
             writer.writerow(header)
 
-            # Binary motion mask, written beside the source MP4.
+            # Binary motion mask, written beside the source MP4. Single-channel,
+            # so frames go to the writer as they are with no BGR conversion.
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
             analysis_path = video_path.replace(".mp4", ".avi")
-            analysis_writer = cv2.VideoWriter(analysis_path, fourcc, self.frame_rate, (self.target_width,self.target_height))
+            analysis_writer = cv2.VideoWriter(analysis_path, fourcc, self.frame_rate, (self.target_width,self.target_height), isColor=False)
 
             frame_idx = 0
             while cap.isOpened():
@@ -718,14 +720,12 @@ class EZMiceApp:
                 # Pixels that changed by more than 25 gray levels become the mask.
                 diff = cv2.absdiff(warp_frame, prev_warp)
                 _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-                thresh_color = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
-                analysis_writer.write(thresh_color) ###thresh_color
+                analysis_writer.write(thresh)
 
                 row_data = [frame_idx, round(current_time, 3)]
                 for r, c, x1, y1, x2, y2 in well_boxes:
-                    well_roi = thresh[y1:y2, x1:x2]
-                    motion_index = np.sum(well_roi > 0)
+                    motion_index = cv2.countNonZero(thresh[y1:y2, x1:x2])
                     row_data.append(motion_index)
 
                 writer.writerow(row_data)
@@ -740,9 +740,9 @@ class EZMiceApp:
            file is <save folder>/image.jpg. A standalone preview camera is
            closed first. The camera runs for one second before the capture so
            auto exposure can settle. When Manual is on, a 50-pixel grid
-           is drawn on that still first and the popup title says the grid is
-           shown. White balance and shutter are left on auto.
-           Runs on the Tk thread.
+           is drawn on that still first (colour lines, so the still is read
+           back as BGR) and the popup title says the grid is shown. Exposure
+           is left on auto. Runs on the Tk thread.
         E: Capture and display failures are caught, shown in an error dialog,
            and not re-raised. A busy camera is reported the same way.
         R: None.
@@ -775,10 +775,10 @@ class EZMiceApp:
                     cv2.line(grid_img, (0, y*step_size), (1456, y*step_size), color, 4)
                     cv2.line(grid_img, (0, 1088 - y*step_size), (1456, 1088 - y*step_size), color, 4)
                 for x in range(6):
-                    color = (0, 255-40*y, 40*x)
+                    color = (0, 255-40*x, 40*x)
                     cv2.line(grid_img, (x*step_size, 0), (x*step_size, 1088), color, 4)
                     cv2.line(grid_img, (1456 - x*step_size, 0), (1456 - x*step_size, 1088), color, 4)
-                    cv2.imwrite(image_path, grid_img)
+                cv2.imwrite(image_path, grid_img)
             pil_img = Image.open(image_path).resize((640,400), Image.LANCZOS)
             popup = tk.Toplevel(self.master)
             popup.title("Captured Image" + (" (Grid Shown)" if self.manual_cal.get() else " (No Grid)"))
@@ -812,22 +812,23 @@ class EZMiceApp:
 
     def calibrate_plate(self):
         """
-        B: Samples white balance and shutter speed, detects the plate, and
-           previews the 8x12 grid. A standalone preview camera is closed
-           first. The camera starts at 1456x1088 with auto exposure and auto
-           white balance on and the live preview showing; after 2 seconds the
-           last frame's colour gains and exposure time are read from the
-           camera metadata, stored on self, and pinned (auto off, analogue
-           gain 1.0). The still is taken when the operator unticks Preview.
-           Corner detection draws on that frame (or copies the manual
-           entries); the result is warped and a 9-by-13 line grid is drawn on
-           top. Outer boundary lines are orange; inner lines are green. The
-           preview is shown from the JPEG, then both temporary JPEGs are
-           deleted. The popup and status text are created on the Tk thread via
-           master.after. Recording later uses this shutter.
+        B: Samples the shutter speed, detects the plate, and previews the 8x12
+           grid. A standalone preview camera is closed first. The camera
+           starts at 1456x1088 with auto exposure on and the live preview
+           showing; after 2 seconds the last frame's exposure time is read
+           from the camera metadata, stored on self, and pinned (auto
+           exposure off, analogue gain 1.0). The still is taken when the
+           operator unticks Preview, and is read back as a single-channel
+           image. Corner detection draws on a BGR copy of that frame (or
+           copies the manual entries); the result is warped and a 9-by-13
+           line grid is drawn on top. Outer boundary lines are orange; inner
+           lines are green. The annotated, unwarped frame is what is saved
+           and shown in the popup; both temporary JPEGs are deleted. The popup
+           and status text are created on the Tk thread via master.after.
+           Recording later uses this shutter.
         E: Capture, load, and preview failures are caught, shown in an error
            dialog, and not re-raised. The camera and busy flag are always reset.
-        R: None. On the success path, self.plate_corners, self.awbgains, and self.shutter are updated.
+        R: None. On the success path, self.plate_corners and self.shutter are updated.
         P: None. Reads self.save_path and the plate geometry fields.
         """
         image_path = self.save_path.get() + '/calibration_capture.jpg'
@@ -842,27 +843,25 @@ class EZMiceApp:
 
             with Picamera2() as camera:
                 self.camera = camera
-                # Auto exposure and auto white balance are on by default.
+                # Auto exposure is on by default.
                 camera.configure(camera.create_preview_configuration(
                     main={"size": (1456, 1088)},
+                    lores={"size": (320, 240)},
+                    display="lores",
                     controls={"FrameDurationLimits": (1000000 // self.frame_rate,) * 2}))
                 #camera.zoom = (0.39, 0.3, 0.25, 0.25)
-                camera.start_preview(Preview.QT, x=400, y=0, width=400, height=400)
+                camera.start_preview(Preview.QT)
                 self.preview_open.set(1)
                 camera.start()
-                # Let auto AWB and auto shutter settle, then pin both.
+                # Let auto exposure settle, then pin the shutter.
                 time.sleep(2)
                 metadata = camera.capture_metadata()
-                self.awbgains = metadata["ColourGains"]
                 self.shutter = metadata["ExposureTime"]
                 camera.set_controls({
                     "AeEnable": False,
-                    "AwbEnable": False,
-                    "ColourGains": self.awbgains,
                     "ExposureTime": self.shutter,
                     "AnalogueGain": 1.0,
                 })
-                print(self.awbgains)
                 print(self.shutter)
                 print(metadata["AnalogueGain"])      # gain auto exposure chose; recording locks 1.0
 
@@ -870,15 +869,16 @@ class EZMiceApp:
                     time.sleep(0.1)
 
                 camera.capture_file(image_path)
+                print("Captured")
             self.camera = None                       # don't leave a closed camera behind
 
-            img = cv2.imread(image_path)
-            if img is None:
+            gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            if gray is None:
                 self.master.after(0, lambda: messagebox.showerror("Error", "Failed to load calibration image."))
                 return
 
-            gray = self.find_plate_corners(img)
-            warped = self.apply_warp(gray)
+            overlay = self.find_plate_corners(gray)
+            warped = self.apply_warp(overlay)
 
             # Inset grid: 8 rows need 9 lines, 12 columns need 13. The step is
             # (target - 2*margin) so the outer lines sit margin pixels inward.
@@ -893,7 +893,7 @@ class EZMiceApp:
                 x = int(c * col_step) + self.pmarg_x
                 cv2.line(warped, (x, 0), (x, self.target_height), (0, 150, 255 if c%12==0 else 0), 2)
 
-            cv2.imwrite(preview_path, gray) #####warped
+            cv2.imwrite(preview_path, overlay) #####warped
             pil_img = Image.open(preview_path).resize((640,400), Image.LANCZOS)
 
             for path in (image_path, preview_path):
@@ -901,7 +901,7 @@ class EZMiceApp:
                     os.remove(path)
                 else:
                     print(f"Failed to delete {path}")
-
+            print("Image processed")
             # Widgets must be created on the Tk thread.
             def show_popup():
                 popup = tk.Toplevel(self.master)
