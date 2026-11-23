@@ -68,14 +68,12 @@ class EZMiceApp:
         self.style.theme_use('clam')
 
         # Operator form. Read at record time; nothing is validated until then.
-        self.camera = None
-        self.busy = False   # True while record/calibrate owns the camera
         self.record_duration = tk.StringVar()
         self.chamber_number = tk.StringVar()
         self.animal_tag = tk.StringVar()
         self.save_path = tk.StringVar()
         self.recording = False
-        self.preview_open = tk.IntVar()  # 0 = closed, 1 = open
+        self.calibrating = False
         # 0 = short assay at 30 fps, 1 = extended assay at 2 fps.
         self.extended_assay = tk.IntVar() # 0 "short" or 1 "extended"
         # Stimulus schedule text ("time:chars,...") and the serial tick length.
@@ -164,7 +162,8 @@ class EZMiceApp:
         self.record_button.grid(row=7, column=0, sticky='ew', padx=5, pady=5)
 
         ttk.Button(self.master, text='Capture Image', command=self.capture_and_display).grid(row=7, column=2, sticky='ew', padx=5, pady=5)
-        ttk.Button(self.master, text='Capture & Calibrate Plate', command=self.capture_and_calibrate).grid(row=8, column=2, sticky='ew', padx=5, pady=5)
+        self.calibrate_button = ttk.Button(self.master, text='Capture & Calibrate Plate', command=self.toggle_calibrate)
+        self.calibrate_button.grid(row=8, column=2, sticky='ew', padx=5, pady=5)
 
         self.info_label = ttk.Label(self.master, text='')
         self.info_label.grid(row=8, column=0, columnspan=2, padx=5, pady=5)
@@ -183,8 +182,6 @@ class EZMiceApp:
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_x))
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_y))
 
-        # Preview toggle
-        ttk.Checkbutton(self.master, text="Preview", variable=self.preview_open, command=self.toggle_preview).grid(row=7, column=1, padx=5, pady=2)
         # Video processing toggle
     def toggle_coords(self):
         """
@@ -200,37 +197,6 @@ class EZMiceApp:
                 entry.grid(row=int(i/4 - 1 + 10), column=int(i%4), padx=5, pady=2)
             else:
                 entry.grid_remove()
-
-    def toggle_preview(self):
-        """
-        B: Preview checkbox callback. Tk flips preview_open before calling
-           this, so its value is the state the operator wants. Ticked: opens
-           a camera if none exists, configures it at 1456x1088, shows the Qt
-           preview window, and starts the camera if it is not already
-           running. Unticked: stops the preview, and closes the camera too
-           unless a recording or calibration (self.busy) is using it.
-        E: Failures are caught, the box is unticked, and the error is printed.
-        R: None.
-        P: None. Reads self.preview_open, self.camera, and self.busy.
-        """
-        try:
-            if self.preview_open.get():              # box was just ticked
-                if self.camera is None:
-                    self.camera = Picamera2()
-                    self.camera.configure(self.camera.create_preview_configuration(main={"size": (1456, 1088)}))
-                # Preview.QT draws in software. QTGL and DRM both failed on this rotated display.
-                self.camera.start_preview(Preview.QT)
-                if not self.camera.started:
-                    self.camera.start()
-
-            elif self.camera is not None:            # box was just unticked
-                self.camera.stop_preview()
-                if not self.busy:                    # standalone preview: free the camera
-                    self.camera.close()
-                    self.camera = None
-        except Exception as e:
-            self.preview_open.set(0)
-            print(f"Error occurred while toggling preview: {e}")
 
     def apply_warp(self, img):
         """
@@ -432,9 +398,6 @@ class EZMiceApp:
         P: None. Reads self.recording, self.busy, self.save_path, and self.record_duration.
         """
         if not self.recording:
-            if self.busy:
-                messagebox.showerror("Error", "The camera is busy with another task.")
-                return
             if not self.save_path.get():
                 messagebox.showerror("Error", "Please select a folder path first.")
                 return
@@ -477,18 +440,9 @@ class EZMiceApp:
         filename = save_dir + self.get_filename()
         fileType = ".mp4"
         self.frame_rate = 2 if self.extended_assay.get() else 30
-        self.busy = True
-        completed = False
 
         try:
-            # Free a standalone preview camera so a second Picamera2 can open.
-            if self.camera is not None:
-                self.camera.close()
-                self.camera = None
-                self.preview_open.set(0)
-
             with Picamera2() as camera:
-                self.camera = camera
                 # Controls in the configuration are applied when the camera starts.
                 camera.configure(camera.create_video_configuration(
                     main={"size": (1456, 1088)},
@@ -507,8 +461,6 @@ class EZMiceApp:
 
                 camera.start_preview(Preview.QT)
 
-                self.preview_open.set(1)
-
                 while (self.recording and self.scheduled_start.get() != "" and
                        round((datetime.datetime.now().hour +
                               datetime.datetime.now().minute/100.0), 2) != float(self.scheduled_start.get())):
@@ -523,20 +475,12 @@ class EZMiceApp:
                     time.sleep(0.1)
 
                 camera.stop_recording()
-                if self.preview_open.get():
-                    camera.stop_preview()
-                self.preview_open.set(0)
-
-                completed = self.recording          # False if Stop was pressed
+                camera.stop_preview()
                 # Clearing this also ends send_serial before the remux and analysis.
                 self.recording = False
-            # The camera is closed here, before the remux.
-            self.camera = None
-            self.busy = False
 
-            msg = f"Video saved to {filename}" if completed else "Recording stopped."
+            msg = f"Recording ended."
             self.master.after(0, lambda: self.info_label.config(text=msg))
-
             # Stream copy. -framerate stamps the raw H264, which has no timestamps.
             #command = f"ffmpeg -y -framerate {self.frame_rate} -i {filename}.h264 -c copy {filename}.mp4"
             command = f'MP4Box -fps {self.frame_rate} -add "{filename}.h264" -new "{filename}.mp4"'
@@ -548,8 +492,6 @@ class EZMiceApp:
         except Exception as e:
             self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Recording failed: {m}"))
         finally:
-            self.camera = None
-            self.busy = False
             self.recording = False
             self.master.after(0, lambda: self.record_button.config(text='Record & Analyze'))
 
@@ -748,24 +690,14 @@ class EZMiceApp:
         R: None.
         P: None. Reads self.save_path and self.manual_cal.
         """
-        if self.busy:
-            messagebox.showerror("Error", "The camera is busy with another task.")
-            return
         try:
             # Free a standalone preview camera so a second Picamera2 can open.
-            if self.camera is not None:
-                self.camera.close()
-                self.camera = None
-                self.preview_open.set(0)
-
             with Picamera2() as camera:
-                self.camera = camera
                 image_path = self.save_path.get() + '/image.jpg'
                 camera.configure(camera.create_still_configuration(main={"size": (1456, 1088)}))
                 camera.start()
                 time.sleep(1)    # let auto exposure settle
                 camera.capture_file(image_path)
-            self.camera = None   # don't leave a closed camera behind
             # Drawing grid overlay for coordinate finding in manual calibration mode
             if self.manual_cal.get():
                 grid_img = cv2.imread(image_path)
@@ -787,28 +719,37 @@ class EZMiceApp:
             popup_label.image = tk_img  # Keep reference to prevent garbage collection!
             popup_label.pack(padx=10, pady=10)
         except Exception as e:
-            self.camera = None
             messagebox.showerror("Error", f"Could not capture image: {e}")
 
-    def capture_and_calibrate(self):
+    def toggle_calibrate(self):
         """
-        B: Button callback. Checks that the camera is free and a folder is
-           chosen, then starts calibrate_plate on a daemon thread, the same
-           way toggle_record starts record_with_preview. The Tk thread is
-           never blocked, so the Preview checkbox stays usable.
-        E: A busy camera or a missing folder is shown in an error dialog and
-           nothing is started.
+        B: Starts a recording, or requests that the current one stop.
+           Starting requires a folder, an integer duration, and a free camera.
+           It sets self.recording, launches record_with_preview on a daemon
+           thread, and relabels the button "Stop". Pressing Stop clears
+           self.recording so the camera loop and the Arduino loop both exit.
+           The button label returns to "Record & Analyze" when the camera
+           thread finishes.
+        E: A missing folder, a non-integer duration, or a busy camera is shown
+           in an error dialog and the recording is not started. ValueError is
+           caught and not re-raised.
         R: None.
-        P: None. Reads self.busy and self.save_path.
+        P: None. Reads self.recording, self.busy, self.save_path, and self.record_duration.
         """
-        if self.busy:
-            messagebox.showerror("Error", "The camera is busy with another task.")
-            return
-        if not self.save_path.get():
-            messagebox.showerror("Error", "Please select a folder path first.")
-            return
-        self.calibrate_thread = threading.Thread(target=self.calibrate_plate, daemon=True)
-        self.calibrate_thread.start()
+        if not self.calibrating:
+            if not self.save_path.get():
+                messagebox.showerror("Error", "Please select a folder path first.")
+                return
+            try:
+                self.calibrating = True
+                self.calibrate_thread = threading.Thread(target=self.calibrate_plate, daemon=True)
+                self.calibrate_thread.start()
+                self.calibrate_button.config(text = 'Finish Calibration')
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to start plate calibration: {e}")
+        else:
+            self.calibrating = False
+            self.calibrate_button.config(text='Capture and Calibrate Plate')
 
     def calibrate_plate(self):
         """
@@ -833,16 +774,9 @@ class EZMiceApp:
         """
         image_path = self.save_path.get() + '/calibration_capture.jpg'
         preview_path = self.save_path.get() + '/calibrated_plate_preview.jpg'
-        self.busy = True
         try:
             # Free a standalone preview camera so a second Picamera2 can open.
-            if self.camera is not None:
-                self.camera.close()
-                self.camera = None
-                self.preview_open.set(0)
-
             with Picamera2() as camera:
-                self.camera = camera
                 # Auto exposure is on by default.
                 camera.configure(camera.create_preview_configuration(
                     main={"size": (1456, 1088)},
@@ -851,7 +785,6 @@ class EZMiceApp:
                     controls={"FrameDurationLimits": (1000000 // self.frame_rate,) * 2}))
                 #camera.zoom = (0.39, 0.3, 0.25, 0.25)
                 camera.start_preview(Preview.QT)
-                self.preview_open.set(1)
                 camera.start()
                 # Let auto exposure settle, then pin the shutter.
                 time.sleep(2)
@@ -865,12 +798,11 @@ class EZMiceApp:
                 print(self.shutter)
                 print(metadata["AnalogueGain"])      # gain auto exposure chose; recording locks 1.0
 
-                while self.preview_open.get():       # untick Preview to take the shot
+                while self.calibrating:
                     time.sleep(0.1)
 
                 camera.capture_file(image_path)
                 print("Captured")
-            self.camera = None                       # don't leave a closed camera behind
 
             gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
             if gray is None:
@@ -914,15 +846,12 @@ class EZMiceApp:
             self.master.after(0, show_popup)
 
         except Exception as e:
-            self.camera = None
             self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Calibration capture failed: {m}"))
-        finally:
-            self.busy = False
 
 def main():
     """
     B: Opens the EZMice window and runs until it is closed. Creates the Tk
-       root, constructs EZMiceApp on it, and enters mainloop.
+    root, constructs EZMiceApp on it, and enters mainloop.
     E: Tk errors during startup propagate.
     R: None.
     P: None.
