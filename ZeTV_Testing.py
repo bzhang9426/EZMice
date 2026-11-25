@@ -310,7 +310,7 @@ class EZMiceApp:
             print(self.signal_list[0].encode('ascii'))
             self.signal_tracker.add(self.signal_list[0])
             print(self.signal_list[len(self.signal_list) - 1].encode('ascii'))
-            self.signal_tracker.remove(self.signal_list[len(self.signal_list) - 1])
+            self.signal_tracker.remove(self.signal_list[len(self.signal_list) - 1]) ###KEYERROR!
             self.signal_list = self.signal_list[1:] + self.signal_list[0]
         return last_time
 
@@ -374,6 +374,7 @@ class EZMiceApp:
                     if off_char in self.signal_tracker:
                         print(off_char.encode('ascii'))
                         self.signal_tracker.remove(off_char)
+                self.signal_list = self.signal_input.get().split(":")[0] ###NEWCODE
 
             if self.recording and recording_tracker == 0:
                 recording_tracker = 1

@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-EZMice v0.4.1 — well-plate recording and per-well motion scoring.
+ZeTV (Sleeptest 2.2) — well-plate recording, stimulus, control, and per-well motion scoring.
 
-B: Records a plate assay, pulses an Arduino from a stimulus schedule, and
-   writes a motion index for each of the 96 wells. Short assays run at 30 fps;
-   Extended assays run at 2 fps and key the Arduino off the clock minute.
-   Picamera2 (monochrome IMX296) records H264, ffmpeg remuxes it at that frame
+Behavior: Records a plate assay, pulses an Arduino from a stimulus schedule featuring
+   multicolored LEDs / solenoids, and optionally writes a motion index for each 
+   of the 96 wells. Short assays run at 30 fps; Extended assays run at 2 fps and
+   key the Arduino off the clock minute.
+
+   Picamera2 (monochrome IMX296) records H264, mp4Box remuxes it at that frame
    rate, and OpenCV warps the plate before frame-subtraction. Calibration can
    lock the shutter speed, or the operator can type the four corners.
-E: None at import. Each method reports its own failures.
-R: None. Runs until the window is closed.
-P: None. Start with `python3 ezmice.py`.
+Exception: None at import. Each method reports its own failures.
+Return: None. Runs until the window is closed.
+Parameter: None. Start with `python3 ezmice.py`.
 """
 
 import tkinter as tk
@@ -52,10 +54,11 @@ class EZMiceApp:
            a recording starts. Plate corners default to a rectangle inside the
            old 1296x972 frame; the camera now runs at 1456x1088, so
            run Capture & Calibrate Plate (or type the corners) before the
-           first recording. The warp target is 600x400 with margins 48 and 34.
+           first recording. The warp target for live image processing
+           is 600x400 with margins accounting for the shape of the plate.
            Manual corners default to TL (150, 100), TR (1150, 100),
-           BL (150, 800), BR (1150, 800). The shutter is replaced when
-           Capture & Calibrate samples the camera.
+           BL (150, 800), BR (1150, 800). The exposure (shutter speed) field
+           is replaced when Capture & Calibrate samples the camera.
         E: None.
         R: None.
         P: master — Tk root window.
@@ -91,7 +94,7 @@ class EZMiceApp:
         self.target_height = 400
 
         # Video processing toggle:
-        self.processing_on = True
+        self.processing_on = False
 
         # Manual corner entries. Hidden until the Manual checkbox is on.
         self.manual_cal = tk.IntVar()
@@ -106,8 +109,8 @@ class EZMiceApp:
         self.br_y = tk.IntVar(value=800)
         # Pixel margin on the warped canvas. Scoring and the calibration grid
         # both step by (target - 2*margin) / wells.
-        self.pmarg_x = 48
-        self.pmarg_y = 34
+        self.pmarg_x = 10
+        self.pmarg_y = 0
 
         # Placeholder until record_with_preview reads the Extended checkbox.
         self.frame_rate = 2 if self.extended_assay.get() else 30
@@ -181,8 +184,7 @@ class EZMiceApp:
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.bl_y))
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_x))
         self.coord_entries.append(ttk.Entry(self.master, textvariable=self.br_y))
-
-        # Video processing toggle
+    
     def toggle_coords(self):
         """
         B: Shows or hides the eight manual corner entries. When Manual is on,
@@ -203,7 +205,7 @@ class EZMiceApp:
         B: Stretches the calibrated plate so it fills the target rectangle.
            Maps self.plate_corners, ordered TL-TR-BR-BL, onto (0, 0),
            (target_width, 0), (target_width, target_height), (0, target_height).
-           Pixels outside the quad are dropped.
+           Pixels outside the quadrilateral are dropped.
         E: cv2.error if plate_corners are not four finite, non-collinear points.
         R: Warped image with the target size and the same number of channels as img.
         P: img — BGR or single-channel frame that contains plate_corners.
@@ -219,14 +221,13 @@ class EZMiceApp:
 
     def build_stim_dic(self):
         """
-        B: Turns the Stimulus Set field into {time_key: command_characters}.
-           An empty field selects a built-in schedule. Extended mode keys that
-           schedule by clock minute, every two minutes from now through
-           now+10, each value "w". Short mode uses elapsed seconds:
+        B: Turns the Stimulus Set entry field into {time_key: command_characters}.
+           An empty field selects a built-in schedule. By default, extended mode uses a schedule
+           that runs by clock hour and minute. Short mode uses elapsed seconds: e.g.
            {1: "w", 2: "wr", 3: "rg", 4: "gv", 5: "vs", 6: "sh", 7: "h"}.
            A non-empty field is comma-separated "time:chars" items in either
            mode. Characters for the same time are concatenated; each is later
-           written as one ASCII byte.
+           written as a ASCII command to be processed by the arduino
         E: A missing colon or a non-numeric time is caught, shown in an error
            dialog (posted to the Tk thread), and not re-raised. The dict
            parsed before that item is returned.
@@ -257,7 +258,11 @@ class EZMiceApp:
 
     def switch_signal(self, arduino, duration, last_time):
            """
-           B: Switches the specified signals for a given duration.
+           B: Switches the specified signals for a given duration. The first and last
+              characters in signal_list are sent as serial commands to the Arduino. At
+              any given time, the tail of the signal_list is the item currently on and
+              the head of the signal_list is the item to be turned on next. The signal_list
+              rotates like a cyclic queue, iterating through all signals present in the list.
            E: None.
            R: None.
            P: None.
@@ -331,6 +336,7 @@ class EZMiceApp:
                     if off_char in self.signal_tracker:
                         arduino.write(off_char.encode('ascii'))
                         self.signal_tracker.remove(off_char)
+                self.signal_list = self.signal_input.get().split(":")[0] ###NEWCODE
             # Update recording tracker to exit the loop after recording turns off
             if self.recording and recording_tracker == 0:
                 recording_tracker = 1
@@ -376,7 +382,7 @@ class EZMiceApp:
            the chamber number, animal tag, and local timestamp. The leading
            slash makes it a suffix of the folder chosen above.
         E: None.
-        R: String like "/Chamber1_TagA12_20261028_094301", with no extension.
+        R: String like "/Chamber1_TagA12_2026-10-28_09-43-01", with no extension.
         P: None. Reads self.chamber_number and self.animal_tag.
         """
         now = datetime.datetime.now()
@@ -497,14 +503,15 @@ class EZMiceApp:
 
     def find_plate_corners(self, gray):
         """
-        B: Sets self.plate_corners and returns a BGR copy of the frame with any
+        B: Finds largest quadrilateral object in frame (e.g. the well plate)
+           Sets self.plate_corners and returns a BGR copy of the frame with any
            detection overlay. The frame is already single-channel (the sensor
            is monochrome), so there is no colour conversion on the way in.
            Manual mode copies TL, TR, BR, BL from the eight entries and does
            no detection. Otherwise the frame is blurred and contrast-stretched.
-           Canny runs at 1/14 and 1/5.5 of that image's Otsu value. Those
-           contours are painted back on, 20 px thick, and a 7x7 close joins
-           gaps. A second Canny (20, 50) produces the contours that are
+           Canny runs hysteresis thresholds at fractions of the image's Otsu value.
+           The contours are painted back on with enhanced sickness and a 7x7 kernel
+           closes the gaps. A second Canny (20, 50) produces the contours that are
            scored. Largest first: the convex hull is drawn red, its polygon
            green, and every contour blue, on the BGR copy. The first polygon
            with 4 vertices is ordered and saved. If none qualifies, the
@@ -527,11 +534,11 @@ class EZMiceApp:
 
         # Otsu supplies the Canny thresholds; the binary image itself is discarded.
         otsu_thresh, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        edged1 = cv2.Canny(blurred, int(otsu_thresh/14), int(otsu_thresh/5.5))
+        edged1 = cv2.Canny(blurred, int(otsu_thresh/6), int(otsu_thresh/2))
 
         contours1, _ = cv2.findContours(edged1.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         # Thick white redraw turns a broken rim into a solid band for the close.
-        cv2.drawContours(edged1, contours1, -1, 255, 20)
+        cv2.drawContours(edged1, contours1, -1, 255, 10)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7,7))
         closed_mask = cv2.morphologyEx(edged1, cv2.MORPH_CLOSE, kernel)
@@ -847,7 +854,8 @@ class EZMiceApp:
 
         except Exception as e:
             self.master.after(0, lambda m=str(e): messagebox.showerror("Error", f"Calibration capture failed: {m}"))
-
+        finally:
+            camera.close()
 def main():
     """
     B: Opens the EZMice window and runs until it is closed. Creates the Tk
